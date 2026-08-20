@@ -1,0 +1,9 @@
+FROM mcr.microsoft.com/playwright:v1.46.0-jammy
+WORKDIR /e2e
+RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
+COPY tests/e2e/package.json ./
+RUN npm install
+COPY tests/e2e/ .
+COPY tests/docker/entrypoint.e2e.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+ENTRYPOINT ["/entrypoint.sh"]

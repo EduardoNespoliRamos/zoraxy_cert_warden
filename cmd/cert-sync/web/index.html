@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="zoraxy.csrf.Token" content="{{.csrfToken}}">
+    <title>Cert Warden Sync</title>
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Certificate File Sync</h1>
+            <p class="subtitle">Cert Warden &rarr; Zoraxy</p>
+        </header>
+
+        <section id="overview" class="card">
+            <h2>Status</h2>
+            <div id="overview-content">
+                <p>Loading...</p>
+            </div>
+        </section>
+
+        <section class="actions">
+            <button id="btn-add" class="btn btn-primary">Add Certificate</button>
+            <button id="btn-refresh" class="btn">Refresh</button>
+        </section>
+
+        <section id="certificates">
+            <h2>Certificates</h2>
+            <div id="cert-list">
+                <p>Loading...</p>
+            </div>
+        </section>
+
+        <div id="modal" class="modal hidden">
+            <div class="modal-content">
+                <span class="close">&times;</span>
+                <h2 id="modal-title">Edit Certificate</h2>
+                <form id="cert-form">
+                    <input type="hidden" id="cert-original-name">
+                    <label>
+                        Name
+                        <input type="text" id="cert-name" required>
+                    </label>
+                    <label>
+                        Source Certificate
+                        <input type="text" id="cert-source-cert" required>
+                    </label>
+                    <label>
+                        Source Private Key
+                        <input type="text" id="cert-source-key" required>
+                    </label>
+                    <label>
+                        Target Directory
+                        <input type="text" id="cert-target-dir" required>
+                    </label>
+                    <label>
+                        Target Name
+                        <input type="text" id="cert-target-name" required>
+                    </label>
+                    <label class="inline">
+                        <input type="checkbox" id="cert-auto-sync">
+                        Automatic Sync
+                    </label>
+                    <label class="inline">
+                        <input type="checkbox" id="cert-filesystem-watch">
+                        Filesystem Watch
+                    </label>
+                    <label>
+                        Poll Interval (seconds)
+                        <input type="number" id="cert-poll-interval" min="1" value="10">
+                    </label>
+                    <label class="inline">
+                        <input type="checkbox" id="cert-fallback">
+                        Set as Zoraxy Fallback Certificate
+                    </label>
+                    <div class="form-actions">
+                        <button type="submit" class="btn btn-primary">Save</button>
+                        <button type="button" id="btn-validate" class="btn">Validate</button>
+                        <button type="button" id="btn-sync-now" class="btn">Sync Now</button>
+                        <button type="button" id="btn-delete" class="btn btn-danger">Delete</button>
+                    </div>
+                </form>
+                <div id="modal-message" class="message hidden"></div>
+            </div>
+        </div>
+    </div>
+
+    <script src="js/app.js"></script>
+</body>
+</html>
