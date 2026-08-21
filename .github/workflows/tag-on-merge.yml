@@ -103,9 +103,15 @@ jobs:
     if: needs.identify-source.outputs.should_tag == 'true'
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Trigger release workflow
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="v${{ needs.identify-source.outputs.version }}"
-          gh workflow run release.yml --ref "$TAG" -f tag="$TAG"
+          gh workflow run release.yml \
+            --repo "${{ github.repository }}" \
+            --ref "$TAG" \
+            -f tag="$TAG"
