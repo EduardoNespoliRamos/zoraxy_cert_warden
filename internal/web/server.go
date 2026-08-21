@@ -19,20 +19,22 @@ type Syncer interface {
 
 // Server provides HTTP handlers for the plugin UI and API.
 type Server struct {
-	mu        sync.RWMutex
-	cfg       *config.Config
-	states    map[string]*status.State
-	syncer    Syncer
+	mu         sync.RWMutex
+	cfg        *config.Config
+	states     map[string]*status.State
+	syncer     Syncer
 	configPath string
+	policy     *config.PathPolicy
 }
 
 // NewServer creates a new web server.
-func NewServer(cfg *config.Config, states map[string]*status.State, syncer Syncer, configPath string) *Server {
+func NewServer(cfg *config.Config, states map[string]*status.State, syncer Syncer, configPath string, policy *config.PathPolicy) *Server {
 	return &Server{
 		cfg:        cfg,
 		states:     states,
 		syncer:     syncer,
 		configPath: configPath,
+		policy:     policy,
 	}
 }
 
@@ -106,11 +108,11 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 			s.sendError(w, "invalid JSON", http.StatusBadRequest)
 			return
 		}
-		if err := newCfg.Validate(false); err != nil {
+		if err := newCfg.Validate(false, s.policy); err != nil {
 			s.sendError(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		if err := newCfg.Save(s.configPath); err != nil {
+		if err := newCfg.Save(s.configPath, s.policy); err != nil {
 			s.sendError(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -141,7 +143,7 @@ func (s *Server) handleCertificates(w http.ResponseWriter, r *http.Request) {
 			s.sendError(w, "invalid JSON", http.StatusBadRequest)
 			return
 		}
-		if err := newCert.Validate(false); err != nil {
+		if err := newCert.Validate(false, s.policy); err != nil {
 			s.sendError(w, err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -154,7 +156,7 @@ func (s *Server) handleCertificates(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		s.cfg.Certificates = append(s.cfg.Certificates, newCert)
-		if err := s.cfg.Save(s.configPath); err != nil {
+		if err := s.cfg.Save(s.configPath, s.policy); err != nil {
 			s.mu.Unlock()
 			s.sendError(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -229,7 +231,7 @@ func (s *Server) updateCertificate(w http.ResponseWriter, r *http.Request, name 
 		s.sendError(w, "certificate name mismatch", http.StatusBadRequest)
 		return
 	}
-	if err := updated.Validate(false); err != nil {
+	if err := updated.Validate(false, s.policy); err != nil {
 		s.sendError(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -248,7 +250,7 @@ func (s *Server) updateCertificate(w http.ResponseWriter, r *http.Request, name 
 		s.sendError(w, "certificate not found", http.StatusNotFound)
 		return
 	}
-	if err := s.cfg.Save(s.configPath); err != nil {
+	if err := s.cfg.Save(s.configPath, s.policy); err != nil {
 		s.mu.Unlock()
 		s.sendError(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -278,7 +280,7 @@ func (s *Server) deleteCertificate(w http.ResponseWriter, r *http.Request, name 
 		return
 	}
 	s.cfg.Certificates = newCerts
-	if err := s.cfg.Save(s.configPath); err != nil {
+	if err := s.cfg.Save(s.configPath, s.policy); err != nil {
 		s.mu.Unlock()
 		s.sendError(w, err.Error(), http.StatusInternalServerError)
 		return

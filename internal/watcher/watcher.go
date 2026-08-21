@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
+
+	"github.com/eduardoramos/zoraxy-cert-warden/internal/config"
 )
 
 // Watcher combines fsnotify and polling with debounce.
@@ -17,6 +19,7 @@ type Watcher struct {
 	debounceDelay   time.Duration
 	callback        func()
 	fsnotifyEnabled bool
+	policy          *config.PathPolicy
 
 	watcher  *fsnotify.Watcher
 	ticker   *time.Ticker
@@ -28,17 +31,23 @@ type Watcher struct {
 	lastModTimes map[string]time.Time
 }
 
-// New creates a new watcher.
-func New(paths []string, pollInterval, debounceDelay time.Duration, fsnotifyEnabled bool, callback func()) *Watcher {
+// New creates a new watcher after validating all watched paths.
+func New(paths []string, pollInterval, debounceDelay time.Duration, fsnotifyEnabled bool, callback func(), policy *config.PathPolicy) (*Watcher, error) {
+	for _, path := range paths {
+		if _, err := policy.ResolveSource(path, false); err != nil {
+			return nil, fmt.Errorf("invalid watcher path: %w", err)
+		}
+	}
 	return &Watcher{
-		paths:           paths,
+		paths:           append([]string(nil), paths...),
 		pollInterval:    pollInterval,
 		debounceDelay:   debounceDelay,
 		callback:        callback,
 		fsnotifyEnabled: fsnotifyEnabled,
+		policy:          policy,
 		stopCh:          make(chan struct{}),
 		lastModTimes:    make(map[string]time.Time),
-	}
+	}, nil
 }
 
 // Start begins watching the configured paths.
@@ -133,7 +142,11 @@ func (w *Watcher) pollLoop() {
 func (w *Watcher) pollChanged() bool {
 	changed := false
 	for _, p := range w.paths {
-		info, err := os.Stat(p)
+		resolved, err := w.policy.ResolveSource(p, false)
+		if err != nil {
+			continue
+		}
+		info, err := os.Stat(resolved)
 		var modTime time.Time
 		if err == nil {
 			modTime = info.ModTime()

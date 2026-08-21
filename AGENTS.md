@@ -113,6 +113,11 @@ When changing the web UI or API, keep these constraints in mind:
 4. **Introspect spec must match the binary.** The `-introspect` flag prints the
    plugin metadata. Ensure `PermittedAPIEndpoints` and `UIPath` are correct.
 
+5. **Filesystem access is allowlisted.** Source and destination roots come from
+   `CERT_SYNC_ALLOWED_SOURCE_ROOTS` and
+   `CERT_SYNC_ALLOWED_DESTINATION_ROOTS`. Do not make these roots editable from
+   the web UI or bypass `config.PathPolicy` at filesystem boundaries.
+
 ## Coding conventions
 
 - Go 1.23. Keep code simple and explicit.
@@ -123,13 +128,23 @@ When changing the web UI or API, keep these constraints in mind:
 
 ## Release process
 
-This repository uses a Git Flow-inspired release process. Only branches matching
-`release/X.Y.Z` or `hotfix/X.Y.Z` can be merged into `main`, and only through a
-Pull Request.
+This repository uses Git Flow:
 
-1. Create a release or hotfix branch from `main`:
+- `main` contains production-ready code.
+- `develop` is the integration branch.
+- `feature/*` and `bugfix/*` start from and merge into `develop`.
+- `release/X.Y.Z` starts from `develop` and merges into `main`.
+- `hotfix/X.Y.Z` starts from `main` and merges into `main`.
+- Release and hotfix changes must be synchronized from `main` back into
+  `develop` through a Pull Request.
+
+Only `release/X.Y.Z` and `hotfix/X.Y.Z` branches can be merged into `main`.
+Feature and bugfix Pull Requests target `develop`.
+
+1. Create a release branch from `develop` or a hotfix branch from `main`:
 
    ```bash
+   git checkout develop
    git checkout -b release/0.0.1
    ```
 
@@ -143,25 +158,28 @@ Pull Request.
      matrix).
    - Creates and pushes a tag `vX.Y.Z`.
 
-4. The `release.yml` workflow detects the new tag, builds `linux/amd64` and
+4. The workflow dispatches `release.yml`, which builds `linux/amd64` and
    `linux/arm64` binaries, generates `SHA256SUMS`, and creates a GitHub Release
    with auto-generated release notes.
 
-5. Attach release notes or a manual changelog if needed.
+5. Open a Pull Request from `main` to `develop` to synchronize the release or
+   hotfix changes.
+
+6. Attach release notes or a manual changelog if needed.
 
 Manual tags matching `v*.*.*` still work for backwards compatibility, but prefer
 the automated flow.
 
 ### Branch protection
 
-The `main` branch is protected by a GitHub branch protection rule applied via
-`scripts/configure-branch-protection.sh`. It requires:
+The `main` and `develop` branches are protected by GitHub branch protection
+rules applied via `scripts/configure-branch-protection.sh`. They require:
 
 - Pull Request reviews (including code owner review).
 - Status checks to pass.
 - Up-to-date branches before merging.
 - Resolved conversations.
-- Only the repository owner can push/merge to `main`.
+- Only the repository owner can approve protected-branch changes.
 
 Administrators can bypass these settings if needed.
 

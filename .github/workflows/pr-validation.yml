@@ -2,7 +2,10 @@ name: PR Source Branch Validation
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, develop]
+
+permissions:
+  contents: read
 
 jobs:
   validate-source-branch:
@@ -11,11 +14,31 @@ jobs:
     steps:
       - name: Check source branch prefix
         run: |
+          TARGET="${{ github.base_ref }}"
           BRANCH="${{ github.head_ref }}"
-          if [[ "$BRANCH" =~ ^(release|hotfix)/[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Source branch '$BRANCH' is allowed."
-            exit 0
+
+          if [[ "$TARGET" == "main" ]]; then
+            if [[ "$BRANCH" =~ ^(release|hotfix)/[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "Source branch '$BRANCH' is allowed to merge into main."
+              exit 0
+            fi
+            echo "ERROR: Pull requests to main must come from release/X.Y.Z or hotfix/X.Y.Z branches."
+            echo "Received: $BRANCH"
+            exit 1
           fi
-          echo "ERROR: Pull requests to main must come from release/X.Y.Z or hotfix/X.Y.Z branches."
-          echo "Received: $BRANCH"
+
+          if [[ "$TARGET" == "develop" ]]; then
+            if [[ "$BRANCH" == "main" ]] ||
+               [[ "$BRANCH" =~ ^(feature|bugfix)/[A-Za-z0-9._-]+$ ]] ||
+               [[ "$BRANCH" =~ ^(release|hotfix)/[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
+               [[ "$BRANCH" =~ ^dependabot/ ]]; then
+              echo "Source branch '$BRANCH' is allowed to merge into develop."
+              exit 0
+            fi
+            echo "ERROR: Pull requests to develop must come from feature/*, bugfix/*, release/X.Y.Z, hotfix/X.Y.Z, main, or dependabot/* branches."
+            echo "Received: $BRANCH"
+            exit 1
+          fi
+
+          echo "ERROR: Unsupported target branch: $TARGET"
           exit 1

@@ -6,6 +6,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/eduardoramos/zoraxy-cert-warden/internal/config"
 )
 
 func TestWatcher_Polling(t *testing.T) {
@@ -16,9 +18,13 @@ func TestWatcher_Polling(t *testing.T) {
 	}
 
 	var count atomic.Int32
-	w := New([]string{file}, 100*time.Millisecond, 200*time.Millisecond, false, func() {
+	policy := watcherTestPolicy(t, dir)
+	w, err := New([]string{file}, 100*time.Millisecond, 200*time.Millisecond, false, func() {
 		count.Add(1)
-	})
+	}, policy)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := w.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -43,9 +49,13 @@ func TestWatcher_Debounce(t *testing.T) {
 	}
 
 	var count atomic.Int32
-	w := New([]string{file}, 100*time.Millisecond, 300*time.Millisecond, false, func() {
+	policy := watcherTestPolicy(t, dir)
+	w, err := New([]string{file}, 100*time.Millisecond, 300*time.Millisecond, false, func() {
 		count.Add(1)
-	})
+	}, policy)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := w.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -62,4 +72,13 @@ func TestWatcher_Debounce(t *testing.T) {
 	if count.Load() != 1 {
 		t.Fatalf("expected exactly one callback after debounce, got %d", count.Load())
 	}
+}
+
+func watcherTestPolicy(t *testing.T, sourceDir string) *config.PathPolicy {
+	t.Helper()
+	policy, err := config.NewPathPolicy([]string{sourceDir}, []string{sourceDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return policy
 }

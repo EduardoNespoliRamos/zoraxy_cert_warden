@@ -17,8 +17,8 @@ import (
 	"github.com/eduardoramos/zoraxy-cert-warden/internal/config"
 	"github.com/eduardoramos/zoraxy-cert-warden/internal/status"
 	certSync "github.com/eduardoramos/zoraxy-cert-warden/internal/sync"
-	"github.com/eduardoramos/zoraxy-cert-warden/internal/web"
 	"github.com/eduardoramos/zoraxy-cert-warden/internal/watcher"
+	"github.com/eduardoramos/zoraxy-cert-warden/internal/web"
 )
 
 const (
@@ -33,12 +33,13 @@ const (
 var content embed.FS
 
 type manager struct {
-	mu       sync.RWMutex
-	cfg      *config.Config
-	states   map[string]*status.State
-	watchers map[string]*watcher.Watcher
+	mu         sync.RWMutex
+	cfg        *config.Config
+	states     map[string]*status.State
+	watchers   map[string]*watcher.Watcher
 	configPath string
-	logger   *slog.Logger
+	logger     *slog.Logger
+	policy     *config.PathPolicy
 }
 
 func main() {
@@ -48,11 +49,11 @@ func main() {
 		Author:        "Eduardo Ramos",
 		AuthorContact: "",
 		Description:   "Synchronizes certificates from Cert Warden Client into Zoraxy TLS store.",
-		URL:           "https://github.com/eduardoramos/zoraxy-cert-warden",
+		URL:           "https://github.com/EduardoNespoliRamos/zoraxy_cert_warden",
 		Type:          plugin.PluginType_Utilities,
-		VersionMajor:  1,
+		VersionMajor:  0,
 		VersionMinor:  0,
-		VersionPatch:  0,
+		VersionPatch:  1,
 		UIPath:        uiPath,
 		PermittedAPIEndpoints: []plugin.PermittedAPIEndpoint{
 			{Method: "GET", Endpoint: "/plugin.ui/com.eduardoramos.zoraxy.certwarden/api/status", Reason: "Read plugin status"},
@@ -79,7 +80,13 @@ func main() {
 	pluginDir := filepath.Dir(execPath)
 	configPath := filepath.Join(pluginDir, "config.json")
 
-	cfg, err := config.Load(configPath)
+	policy, err := config.PathPolicyFromEnv()
+	if err != nil {
+		logger.Error("failed to initialize path policy", "error", err)
+		os.Exit(1)
+	}
+
+	cfg, err := config.Load(configPath, policy)
 	if err != nil {
 		logger.Error("failed to load config", "error", err)
 		os.Exit(1)
@@ -91,12 +98,16 @@ func main() {
 		watchers:   make(map[string]*watcher.Watcher),
 		configPath: configPath,
 		logger:     logger,
+		policy:     policy,
 	}
 
-	m.ReloadConfig(cfg)
+	if err := m.ReloadConfig(cfg); err != nil {
+		logger.Error("failed to initialize config", "error", err)
+		os.Exit(1)
+	}
 
 	mux := http.NewServeMux()
-	server := web.NewServer(cfg, m.states, m, configPath)
+	server := web.NewServer(cfg, m.states, m, configPath, policy)
 	server.RegisterRoutes(mux, uiPath)
 
 	embedWebRouter := plugin.NewPluginEmbedUIRouter(pluginID, &content, webRoot, uiPath)
@@ -120,33 +131,51 @@ func main() {
 }
 
 func (m *manager) ReloadConfig(cfg *config.Config) error {
+	stagedCfg := *cfg
+	stagedCfg.Certificates = append([]config.CertificateConfig(nil), cfg.Certificates...)
+	if err := stagedCfg.Validate(false, m.policy); err != nil {
+		return err
+	}
+	cfg = &stagedCfg
+
+	newStates := make(map[string]*status.State, len(cfg.Certificates))
+	newWatchers := make(map[string]*watcher.Watcher)
+	for _, certCfg := range cfg.Certificates {
+		newStates[certCfg.Name] = &status.State{Config: certCfg}
+		if !certCfg.Enabled || !certCfg.Sync.AutoSync {
+			continue
+		}
+		paths := []string{certCfg.Source.Certificate, certCfg.Source.PrivateKey}
+		poll := time.Duration(certCfg.Sync.PollIntervalSeconds) * time.Second
+		if poll < time.Second {
+			poll = time.Second
+		}
+		name := certCfg.Name
+		w, err := watcher.New(paths, poll, 2*time.Second, certCfg.Sync.FilesystemWatch, func() {
+			m.SyncCertificate(name)
+		}, m.policy)
+		if err != nil {
+			return err
+		}
+		newWatchers[name] = w
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	m.stopWatchersLocked()
 	m.cfg = cfg
-	m.states = make(map[string]*status.State)
-	m.watchers = make(map[string]*watcher.Watcher)
+	m.states = newStates
+	m.watchers = newWatchers
 
 	for _, certCfg := range cfg.Certificates {
-		st := &status.State{Config: certCfg}
-		m.states[certCfg.Name] = st
 		if certCfg.Enabled {
 			m.syncOneLocked(certCfg.Name)
 		}
-		if certCfg.Enabled && certCfg.Sync.AutoSync {
-			paths := []string{certCfg.Source.Certificate, certCfg.Source.PrivateKey}
-			poll := time.Duration(certCfg.Sync.PollIntervalSeconds) * time.Second
-			if poll < time.Second {
-				poll = time.Second
-			}
-			w := watcher.New(paths, poll, 2*time.Second, certCfg.Sync.FilesystemWatch, func() {
-				m.SyncCertificate(certCfg.Name)
-			})
+		if w, ok := m.watchers[certCfg.Name]; ok {
 			if err := w.Start(); err != nil {
 				m.logger.Error("failed to start watcher", "certificate", certCfg.Name, "error", err)
 			}
-			m.watchers[certCfg.Name] = w
 		}
 	}
 	return nil
@@ -165,9 +194,19 @@ func (m *manager) ValidateCertificate(name string) error {
 	if !ok {
 		return fmt.Errorf("certificate not found")
 	}
-	certInfo, err := certutil.LoadAndValidate(st.Config.Source.Certificate, st.Config.Source.PrivateKey)
 	now := time.Now()
 	st.LastAttemptedSync = &now
+	certPath, err := m.policy.ResolveSource(st.Config.Source.Certificate, true)
+	if err != nil {
+		st.LastError = err
+		return err
+	}
+	keyPath, err := m.policy.ResolveSource(st.Config.Source.PrivateKey, true)
+	if err != nil {
+		st.LastError = err
+		return err
+	}
+	certInfo, err := certutil.LoadAndValidate(certPath, keyPath)
 	st.SourceInfo = certInfo
 	if err != nil {
 		st.LastError = err
@@ -185,10 +224,16 @@ func (m *manager) syncOneLocked(name string) error {
 	now := time.Now()
 	st.LastAttemptedSync = &now
 
-	certInfo, result, err := certSync.Sync(st.Config)
+	certInfo, result, err := certSync.Sync(st.Config, m.policy)
 	st.SourceInfo = certInfo
 
-	info, errStat := os.Stat(st.Config.Source.Certificate)
+	var info os.FileInfo
+	var errStat error
+	if sourcePath, policyErr := m.policy.ResolveSource(st.Config.Source.Certificate, true); policyErr == nil {
+		info, errStat = os.Stat(sourcePath)
+	} else {
+		errStat = policyErr
+	}
 	if errStat == nil {
 		st.LastSourceModification = info.ModTime()
 	}
@@ -211,7 +256,7 @@ func (m *manager) syncOneLocked(name string) error {
 			"fingerprint", result.SourceFP,
 		)
 	} else if result.NoChanges {
-		destFP, _ := certSync.ReadDestinationFingerprint(st.Config.Destination.TargetDirectory, st.Config.Destination.TargetName)
+		destFP, _ := certSync.ReadDestinationFingerprint(st.Config.Destination.TargetDirectory, st.Config.Destination.TargetName, m.policy)
 		st.DestinationFingerprint = destFP
 		m.logger.Info("cert-sync no changes",
 			"certificate", name,
@@ -219,7 +264,7 @@ func (m *manager) syncOneLocked(name string) error {
 	}
 
 	if st.Config.Fallback {
-		currentFallback, _ := certSync.ReadFallback(st.Config.Destination.TargetDirectory)
+		currentFallback, _ := certSync.ReadFallback(st.Config.Destination.TargetDirectory, m.policy)
 		st.FallbackPendingRestart = currentFallback != st.Config.Destination.TargetName
 	} else {
 		st.FallbackPendingRestart = false

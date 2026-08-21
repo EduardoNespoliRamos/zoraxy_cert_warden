@@ -7,6 +7,9 @@ services:
       - "80:80"
       - "443:443"
       - "8000:8000"
+    environment:
+      - CERT_SYNC_ALLOWED_SOURCE_ROOTS=/cert_warden_plugin
+      - CERT_SYNC_ALLOWED_DESTINATION_ROOTS=/opt/zoraxy/config/conf/certs
     volumes:
       - /mnt/raid/docker-compose/zoraxy/config:/opt/zoraxy/config
       - /mnt/raid/docker-compose/zoraxy/plugin:/opt/zoraxy/plugin
