@@ -1,6 +1,7 @@
 const API = {
     status: './api/status',
-    certificates: './api/certificates'
+    certificates: './api/certificates',
+    acknowledgeFallbackRestart: './api/fallback/restart/acknowledge'
 };
 
 const POLL_INTERVAL_MS = 10000;
@@ -69,6 +70,23 @@ function renderOverview(data) {
     container.replaceChildren(statusLine);
     appendParagraph(container, `Configured certificates: ${data.certificates}`);
     appendParagraph(container, counts);
+    if (data.fallback_pending_restart) {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'btn';
+        button.textContent = 'Confirm Zoraxy restart';
+        button.addEventListener('click', async () => {
+            button.disabled = true;
+            try {
+                await fetchJSON(API.acknowledgeFallbackRestart, { method: 'POST' });
+                await loadStatus({ abortPrevious: true });
+            } catch (error) {
+                showStatusError(error.message);
+                button.disabled = false;
+            }
+        });
+        container.appendChild(button);
+    }
 }
 
 function createActionButton(label, className, certName, action) {
