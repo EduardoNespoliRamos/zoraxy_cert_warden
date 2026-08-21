@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 )
 
@@ -13,6 +14,8 @@ const (
 	DefaultSourceRoot          = "/cert_warden_plugin"
 	DefaultDestinationRoot     = "/opt/zoraxy/config/conf/certs"
 )
+
+var safePathRegex = regexp.MustCompile(`^/[A-Za-z0-9_./-]*$`)
 
 // PathPolicy limits source reads and destination writes to operator-approved
 // filesystem roots. It is intentionally separate from the web-managed config.
@@ -63,6 +66,9 @@ func normalizeRoots(roots []string, label string) ([]string, error) {
 		clean := filepath.Clean(root)
 		if clean != root {
 			return nil, fmt.Errorf("allowed %s root must be normalized: %s", label, root)
+		}
+		if !safePathRegex.MatchString(root) {
+			return nil, fmt.Errorf("allowed %s root contains unsupported characters: %s", label, root)
 		}
 		normalized = append(normalized, clean)
 	}
@@ -123,6 +129,9 @@ func resolveAllowedPath(path string, roots []string, label string) (string, erro
 	path = strings.TrimSpace(path)
 	if path == "" || !filepath.IsAbs(path) || filepath.Clean(path) != path {
 		return "", fmt.Errorf("%s path must be absolute and normalized", label)
+	}
+	if !safePathRegex.MatchString(path) {
+		return "", fmt.Errorf("%s path contains unsupported characters", label)
 	}
 
 	resolvedPath, err := resolvePath(path)

@@ -103,6 +103,13 @@ func TestPathPolicy(t *testing.T) {
 	}
 }
 
+func TestPathPolicyRejectsUnsupportedCharacters(t *testing.T) {
+	policy := broadTestPolicy(t)
+	if err := policy.ValidateSource("/tmp/cert file.pem", false); err == nil {
+		t.Fatal("expected path containing spaces to be rejected")
+	}
+}
+
 func TestPathPolicyRejectsSymlinkEscape(t *testing.T) {
 	allowed := t.TempDir()
 	outside := t.TempDir()

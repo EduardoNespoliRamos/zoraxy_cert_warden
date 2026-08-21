@@ -173,8 +173,9 @@ separate them with `:`:
 CERT_SYNC_ALLOWED_SOURCE_ROOTS=/cert_warden_plugin:/mnt/other-certs
 ```
 
-Paths must be absolute and normalized. Symlinks are resolved before access and
-cannot escape the configured roots.
+Paths must be absolute and normalized, and may contain letters, numbers, `/`,
+`.`, `_`, and `-`. Symlinks are resolved before access and cannot escape the
+configured roots.
 
 ## UI
 
