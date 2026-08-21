@@ -10,7 +10,10 @@ generate() {
         -keyout "$OUTDIR/key0.pem" \
         -out "$OUTDIR/certchain0.pem" \
         -subj "/CN=$CN" \
-        -addext "subjectAltName=DNS:$CN"
+        -addext "subjectAltName=DNS:$CN" \
+        -addext "basicConstraints=critical,CA:FALSE" \
+        -addext "keyUsage=critical,digitalSignature,keyEncipherment" \
+        -addext "extendedKeyUsage=serverAuth"
     echo "Generated certificate at $(date)"
 }
 
