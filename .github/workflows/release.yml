@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g. v0.0.1)'
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -12,17 +18,25 @@ jobs:
   build-release:
     runs-on: ubuntu-latest
     steps:
-      - name: Validate tag format
+      - name: Determine release tag
+        id: tag
         run: |
-          TAG="${{ github.ref_name }}"
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${{ github.ref_name }}"
+          fi
           if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "ERROR: Invalid release tag format: $TAG"
             exit 1
           fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
           echo "Releasing $TAG"
 
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
 
       - name: Set up Docker
         uses: docker/setup-buildx-action@v3
@@ -38,5 +52,6 @@ jobs:
       - name: Upload release artifacts
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.tag.outputs.tag }}
           files: dist/*
           generate_release_notes: true

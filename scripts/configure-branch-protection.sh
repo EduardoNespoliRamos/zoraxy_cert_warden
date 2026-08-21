@@ -6,6 +6,13 @@ BRANCH="main"
 
 echo "Configuring branch protection rules for ${REPO}#${BRANCH}..."
 
+# Note: the integration-matrix job from compatibility.yml is intentionally
+# NOT listed as a required status check. Because it uses a build matrix, GitHub
+# reports each matrix entry as a separate check (e.g. "integration-matrix
+# (v3.3.0)"), so a single "integration-matrix" context never resolves. The
+# matrix still runs on every PR/push and is visible in the PR checks, but it
+# does not block merging.
+
 # Check whether the repository belongs to an organization. User-owned
 # repositories do not support user/team push restrictions through the API.
 OWNER_TYPE=$(gh api "repos/${REPO}" --jq '.owner.type')
@@ -27,8 +34,7 @@ gh api "repos/${REPO}/branches/${BRANCH}/protection" \
       "Validate source branch",
       "unit-tests",
       "e2e",
-      "build",
-      "integration-matrix"
+      "build"
     ]
   },
   "enforce_admins": false,
