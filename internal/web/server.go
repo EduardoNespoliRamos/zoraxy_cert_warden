@@ -26,16 +26,67 @@ var (
 // serialized. The candidate is discarded if the mutation or apply fails.
 type ConfigMutation func(*config.Config) error
 
+// CredentialMutation updates the write-only credentials associated with an
+// immutable certificate entry name. Nil API key values preserve existing keys.
+type CredentialMutation struct {
+	Name              string
+	CertificateAPIKey *string
+	PrivateKeyAPIKey  *string
+	Delete            bool
+}
+
 // Manager is the sole owner of configuration and runtime state used by HTTP.
 type Manager interface {
 	SnapshotConfig() *config.Config
 	SnapshotStatus() []status.CertificateStatus
 	ApplyConfig(context.Context, *config.Config) error
 	MutateConfig(context.Context, ConfigMutation) error
+	MutateConfigAndCredentials(context.Context, ConfigMutation, *CredentialMutation) error
+	CredentialsConfigured(string) (bool, bool)
 	SyncCertificate(string) error
 	ValidateCertificate(string) error
+	TestCertWardenConnection(context.Context, string, string, string, string) error
 	FallbackRestartPending() bool
 	AcknowledgeFallbackRestart(context.Context) error
+}
+
+type credentialInput struct {
+	CertificateAPIKey           *string `json:"certificate_api_key,omitempty"`
+	PrivateKeyAPIKey            *string `json:"private_key_api_key,omitempty"`
+	CertificateAPIKeyConfigured bool    `json:"certificate_api_key_configured,omitempty"`
+	PrivateKeyAPIKeyConfigured  bool    `json:"private_key_api_key_configured,omitempty"`
+}
+
+type certificateRequest struct {
+	config.CertificateConfig
+	Credentials *credentialInput `json:"cert_warden_credentials,omitempty"`
+}
+
+type credentialState struct {
+	CertificateAPIKey bool `json:"certificate_api_key_configured"`
+	PrivateKeyAPIKey  bool `json:"private_key_api_key_configured"`
+}
+
+type certificateView struct {
+	config.CertificateConfig
+	Credentials *credentialState `json:"cert_warden_credentials,omitempty"`
+}
+
+type configView struct {
+	Certificates []certificateView `json:"certificates"`
+	LogLevel     string            `json:"log_level,omitempty"`
+}
+
+type configRequest struct {
+	Certificates []certificateRequest `json:"certificates"`
+	LogLevel     string               `json:"log_level,omitempty"`
+}
+
+type certWardenTestRequest struct {
+	ServerURL         string `json:"server_url"`
+	CertificateName   string `json:"certificate_name"`
+	CertificateAPIKey string `json:"certificate_api_key"`
+	PrivateKeyAPIKey  string `json:"private_key_api_key"`
 }
 
 // Server provides HTTP handlers for the plugin UI and API.
@@ -87,12 +138,25 @@ func (s *Server) registerRoutes(mux *http.ServeMux, prefix string) {
 	mux.HandleFunc(health+"/", s.handleNotFound)
 	mux.HandleFunc(api+"/status", s.allow([]string{http.MethodGet}, s.handleStatus))
 	mux.HandleFunc(api+"/config", s.allow([]string{http.MethodGet, http.MethodPost}, s.handleConfig))
+	mux.HandleFunc(api+"/certwarden/test", s.allow([]string{http.MethodPost}, s.handleCertWardenTest))
 	mux.HandleFunc(certificates, s.allow([]string{http.MethodGet, http.MethodPost}, s.handleCertificates))
 	mux.HandleFunc(certificates+"/", func(w http.ResponseWriter, r *http.Request) {
 		s.handleCertificatePath(w, r, certificates)
 	})
 	mux.HandleFunc(api+"/fallback/restart/acknowledge", s.allow([]string{http.MethodPost}, s.handleFallbackRestartAcknowledge))
 	mux.HandleFunc(api+"/", s.handleNotFound)
+}
+
+func (s *Server) handleCertWardenTest(w http.ResponseWriter, r *http.Request) {
+	var request certWardenTestRequest
+	if !s.decodeJSON(w, r, &request) {
+		return
+	}
+	if err := s.manager.TestCertWardenConnection(r.Context(), request.ServerURL, request.CertificateName, request.CertificateAPIKey, request.PrivateKeyAPIKey); err != nil {
+		s.managerError(w, r, "test Cert Warden connection", err)
+		return
+	}
+	sendOK(w)
 }
 
 func (s *Server) allow(methods []string, next http.HandlerFunc) http.HandlerFunc {
@@ -138,12 +202,20 @@ func (s *Server) handleFallbackRestartAcknowledge(w http.ResponseWriter, r *http
 
 func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet {
-		s.sendJSON(w, http.StatusOK, s.manager.SnapshotConfig())
+		s.sendJSON(w, http.StatusOK, s.configView())
 		return
 	}
-	var candidate config.Config
-	if !s.decodeJSON(w, r, &candidate) {
+	var request configRequest
+	if !s.decodeJSON(w, r, &request) {
 		return
+	}
+	candidate := config.Config{LogLevel: request.LogLevel, Certificates: make([]config.CertificateConfig, 0, len(request.Certificates))}
+	for _, certificate := range request.Certificates {
+		if certificate.Credentials != nil && (certificate.Credentials.CertificateAPIKey != nil || certificate.Credentials.PrivateKeyAPIKey != nil) {
+			s.sendError(w, "credentials must be updated through certificate endpoints", http.StatusBadRequest)
+			return
+		}
+		candidate.Certificates = append(candidate.Certificates, certificate.CertificateConfig)
 	}
 	if err := s.manager.ApplyConfig(r.Context(), &candidate); err != nil {
 		s.managerError(w, r, "apply config", err)
@@ -154,14 +226,20 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleCertificates(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet {
-		s.sendJSON(w, http.StatusOK, s.manager.SnapshotConfig().Certificates)
+		s.sendJSON(w, http.StatusOK, s.configView().Certificates)
 		return
 	}
-	var certificate config.CertificateConfig
-	if !s.decodeJSON(w, r, &certificate) {
+	var request certificateRequest
+	if !s.decodeJSON(w, r, &request) {
 		return
 	}
-	err := s.manager.MutateConfig(r.Context(), func(candidate *config.Config) error {
+	certificate := request.CertificateConfig
+	mutation, err := credentialMutationFor(certificate, request.Credentials, true)
+	if err != nil {
+		s.sendError(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+	err = s.manager.MutateConfigAndCredentials(r.Context(), func(candidate *config.Config) error {
 		for _, existing := range candidate.Certificates {
 			if existing.Name == certificate.Name {
 				return errCertificateExists
@@ -169,7 +247,7 @@ func (s *Server) handleCertificates(w http.ResponseWriter, r *http.Request) {
 		}
 		candidate.Certificates = append(candidate.Certificates, certificate)
 		return nil
-	})
+	}, mutation)
 	if errors.Is(err, errCertificateExists) {
 		s.sendError(w, "configuration conflict", http.StatusConflict)
 		return
@@ -214,15 +292,21 @@ func (s *Server) handleCertificatePath(w http.ResponseWriter, r *http.Request, c
 }
 
 func (s *Server) updateCertificate(w http.ResponseWriter, r *http.Request, name string) {
-	var updated config.CertificateConfig
-	if !s.decodeJSON(w, r, &updated) {
+	var request certificateRequest
+	if !s.decodeJSON(w, r, &request) {
 		return
 	}
+	updated := request.CertificateConfig
 	if updated.Name != name {
 		s.sendError(w, "invalid request", http.StatusBadRequest)
 		return
 	}
-	err := s.manager.MutateConfig(r.Context(), func(candidate *config.Config) error {
+	mutation, err := credentialMutationFor(updated, request.Credentials, false)
+	if err != nil {
+		s.sendError(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+	err = s.manager.MutateConfigAndCredentials(r.Context(), func(candidate *config.Config) error {
 		for i := range candidate.Certificates {
 			if candidate.Certificates[i].Name == name {
 				candidate.Certificates[i] = updated
@@ -230,7 +314,7 @@ func (s *Server) updateCertificate(w http.ResponseWriter, r *http.Request, name 
 			}
 		}
 		return errCertificateNotFound
-	})
+	}, mutation)
 	if errors.Is(err, errCertificateNotFound) {
 		s.sendError(w, "certificate not found", http.StatusNotFound)
 		return
@@ -243,7 +327,7 @@ func (s *Server) updateCertificate(w http.ResponseWriter, r *http.Request, name 
 }
 
 func (s *Server) deleteCertificate(w http.ResponseWriter, r *http.Request, name string) {
-	err := s.manager.MutateConfig(r.Context(), func(candidate *config.Config) error {
+	err := s.manager.MutateConfigAndCredentials(r.Context(), func(candidate *config.Config) error {
 		for i := range candidate.Certificates {
 			if candidate.Certificates[i].Name == name {
 				candidate.Certificates = append(candidate.Certificates[:i], candidate.Certificates[i+1:]...)
@@ -251,7 +335,7 @@ func (s *Server) deleteCertificate(w http.ResponseWriter, r *http.Request, name 
 			}
 		}
 		return errCertificateNotFound
-	})
+	}, &CredentialMutation{Name: name, Delete: true})
 	if errors.Is(err, errCertificateNotFound) {
 		s.sendError(w, "certificate not found", http.StatusNotFound)
 		return
@@ -261,6 +345,41 @@ func (s *Server) deleteCertificate(w http.ResponseWriter, r *http.Request, name 
 		return
 	}
 	sendOK(w)
+}
+
+func credentialMutationFor(certificate config.CertificateConfig, input *credentialInput, creating bool) (*CredentialMutation, error) {
+	if certificate.Source.Type == "" {
+		certificate.Source.Type = config.SourceTypeLocal
+	}
+	if certificate.Source.Type != config.SourceTypeCertWarden {
+		return &CredentialMutation{Name: certificate.Name, Delete: true}, nil
+	}
+	mutation := &CredentialMutation{Name: certificate.Name}
+	if input != nil {
+		mutation.CertificateAPIKey = input.CertificateAPIKey
+		mutation.PrivateKeyAPIKey = input.PrivateKeyAPIKey
+	}
+	if creating && (mutation.CertificateAPIKey == nil || mutation.PrivateKeyAPIKey == nil || strings.TrimSpace(*mutation.CertificateAPIKey) == "" || strings.TrimSpace(*mutation.PrivateKeyAPIKey) == "") {
+		return nil, errors.New("remote credentials are required")
+	}
+	if (mutation.CertificateAPIKey == nil) != (mutation.PrivateKeyAPIKey == nil) {
+		return nil, errors.New("both Cert Warden credentials must be supplied together")
+	}
+	return mutation, nil
+}
+
+func (s *Server) configView() configView {
+	cfg := s.manager.SnapshotConfig()
+	view := configView{LogLevel: cfg.LogLevel, Certificates: make([]certificateView, 0, len(cfg.Certificates))}
+	for _, certificate := range cfg.Certificates {
+		item := certificateView{CertificateConfig: certificate}
+		if certificate.Source.Type == config.SourceTypeCertWarden {
+			certKey, privateKey := s.manager.CredentialsConfigured(certificate.Name)
+			item.Credentials = &credentialState{CertificateAPIKey: certKey, PrivateKeyAPIKey: privateKey}
+		}
+		view.Certificates = append(view.Certificates, item)
+	}
+	return view
 }
 
 func (s *Server) decodeJSON(w http.ResponseWriter, r *http.Request, destination interface{}) bool {

@@ -32,9 +32,10 @@ async function resetConfig(page: Page) {
   await page.reload();
 }
 
-test.beforeEach(async ({ page }) => {
-  await resetConfig(page);
-});
+test.describe('local source @compatibility', () => {
+  test.beforeEach(async ({ page }) => {
+    await resetConfig(page);
+  });
 
 test('plugin UI loads and shows default certificate', async ({ page }) => {
   await expect(page.locator('h1')).toContainText('Certificate File Sync');
@@ -44,7 +45,7 @@ test('plugin UI loads and shows default certificate', async ({ page }) => {
 test('certificate card shows Healthy status', async ({ page }) => {
   const card = page.locator('.cert-card').first();
   await expect(card).toBeVisible({ timeout: 15000 });
-  await expect(card.locator('.status-healthy')).toContainText('Healthy');
+  await expect(card.locator('h3 .status-healthy')).toContainText('Healthy');
 });
 
 test('edit modal opens and validates', async ({ page }) => {
@@ -147,7 +148,7 @@ test('CRUD, status, manual sync, empty deletion, and path policy errors work thr
   await expect(card).toContainText('Enabled: Yes');
 
   await card.getByRole('button', { name: 'Sync Now' }).click();
-  await expect(card.locator('.status-healthy')).toContainText('Healthy');
+  await expect(card.locator('h3 .status-healthy')).toContainText('Healthy');
 
   page.once('dialog', dialog => dialog.accept());
   await card.getByRole('button', { name: 'Edit' }).click();
@@ -161,4 +162,5 @@ test('CRUD, status, manual sync, empty deletion, and path policy errors work thr
   await expect(page.locator('#cert-list')).toContainText('No certificates configured.');
   await expect(page.locator('#overview-content')).toContainText('Configured certificates: 0');
   await expect(page.locator('#overview-content').locator('.status-healthy')).toContainText('Healthy');
+});
 });

@@ -9,26 +9,29 @@
 > See [AGENTS.md](AGENTS.md) for guidance when working on this repository.
 
 Plugin for [Zoraxy](https://github.com/tobychui/zoraxy) that synchronizes TLS
-certificates managed by [Cert Warden](https://certwarden.com/) (via the Cert
-Warden Client) into Zoraxy's internal certificate store.
+certificates managed by [Cert Warden](https://certwarden.com/) into Zoraxy's
+internal certificate store. A certificate can come from local Cert Warden
+Client files or directly from a remote Cert Warden API.
 
-The plugin does **not** handle ACME, DNS challenges, or Cloudflare. Those stay
-managed by Cert Warden and the Cert Warden Client. The plugin only consumes the
-local PEM files produced by the client and makes them available to Zoraxy.
+The plugin does **not** handle ACME, DNS challenges, or Cloudflare. Those remain
+managed by Cert Warden. The plugin consumes an existing certificate chain and
+private key and makes them available to Zoraxy.
 
 ## Architecture
 
 ```
-Cert Warden Client
-    -> /cert_warden_plugin/certchain0.pem + key0.pem
-    -> Zoraxy Cert Warden Sync plugin
-    -> /opt/zoraxy/config/conf/certs/example-certificate.pem + .key
-    -> Zoraxy TLS
+Cert Warden Client files                 Cert Warden HTTPS API
+certchain0.pem + key0.pem                combined privatecertchains endpoint
+             \                            /
+              -> Zoraxy Cert Warden Sync plugin
+              -> /opt/zoraxy/config/conf/certs/example-certificate.pem + .key
+              -> Zoraxy TLS
 ```
 
 ## Features
 
-- Detects certificate files written by Cert Warden Client.
+- Reads local Cert Warden Client files or downloads directly from Cert Warden.
+- Supports manual remote queries and automatic remote polling.
 - Validates the presented certificate chain, validity period, server usage, and
   private key correspondence.
 - Transactionally replaces certificate/key pairs using staging files, backups,
@@ -52,7 +55,7 @@ Zoraxy certificate reload API. For a certificate selected through
   Zoraxy to activate a fallback certificate.** The pending warning persists
   until the operator acknowledges it after the restart; acknowledgement itself
   does not restart or reload Zoraxy.
-- Encrypted private keys are not supported. Cert Warden Client must provide an
+- Encrypted private keys are not supported. The selected source must provide an
   unencrypted RSA, EC, or PKCS#8 private key.
 
 ## Requirements
@@ -129,6 +132,18 @@ services:
       - /path/to/cert-warden/output:/cert_warden_plugin:ro
 ```
 
+This is a local-source example. A remote-only deployment does not need the
+Cert Warden Client output volume or `CERT_SYNC_ALLOWED_SOURCE_ROOTS`. Remote TLS
+uses the container's system CA trust. For a private CA, mount a CA bundle and
+set `SSL_CERT_FILE` to its in-container path, for example:
+
+```yaml
+environment:
+  - SSL_CERT_FILE=/etc/ssl/custom/cert-warden-ca.pem
+volumes:
+  - /path/to/cert-warden-ca.pem:/etc/ssl/custom/cert-warden-ca.pem:ro
+```
+
 Place the plugin binary under the mounted plugin volume:
 
 ```
@@ -141,8 +156,9 @@ Place the plugin binary under the mounted plugin volume:
 
 ## Configuration
 
-The plugin is configured entirely through its web UI. Default values match the
-Cert Warden Client output:
+The plugin is configured entirely through its web UI. Each entry selects either
+**Local files** or **Cert Warden API**. Local defaults match Cert Warden Client
+output:
 
 - Source certificate: `/cert_warden_plugin/certchain0.pem`
 - Source private key: `/cert_warden_plugin/key0.pem`
@@ -150,6 +166,40 @@ Cert Warden Client output:
 - Target name: `example-certificate`
 
 Configuration is persisted in `config.json` inside the plugin directory.
+
+### Direct Cert Warden API
+
+For a **Cert Warden API** source, configure these UI fields:
+
+- **Server URL** (`source.cert_warden.server_url`): an HTTPS origin only, with
+  no path, query, fragment, or user information.
+- **Certificate Name** (`source.cert_warden.certificate_name`): the name used by
+  Cert Warden for the requested certificate.
+- **Certificate API Key** and **Private Key API Key**
+  (`cert_warden_credentials.certificate_api_key` and
+  `private_key_api_key`): the two per-certificate download keys issued by Cert
+  Warden. Both are required.
+
+The plugin calls Cert Warden's official combined endpoint:
+
+```
+GET https://<server>/certwarden/api/v1/download/privatecertchains/<certificate_name>
+X-API-Key: <certificate-api-key>.<private-key-api-key>
+```
+
+The response must contain a valid PEM certificate chain and exactly one
+supported unencrypted private key. Downloads have a 30-second timeout and a
+1 MiB response limit. Redirects are not followed, so credentials cannot be
+forwarded to a redirect target. HTTPS certificate-chain and hostname validation
+must succeed against the process's CA trust; insecure TLS and HTTP are not
+supported.
+
+Credentials are stored separately in `secrets.json` beside the plugin binary.
+The plugin writes this file with mode `0600`. API responses expose only
+`certificate_api_key_configured` and `private_key_api_key_configured` booleans;
+the UI uses empty password fields, never reads keys back, and leaves existing
+keys unchanged when both fields are blank. Supplying new keys replaces both as
+a pair. Treat the plugin directory and its persistent volume as sensitive.
 
 ### Path allowlists
 
@@ -182,6 +232,14 @@ configured roots.
   Filesystem Watch. `fsnotify` handles prompt updates and polling still detects
   missed events. Changes are debounced so separately written certificate and
   key files can settle before validation.
+
+Remote sources do not support Filesystem Watch. Every enabled entry performs one
+fetch, validation, and synchronization when configuration is applied, including
+plugin startup, even when Auto Sync is disabled. **Test Connection** fetches and
+validates the remote source without installing it; **Sync Now** fetches,
+validates, and synchronizes it. With Auto Sync enabled, a non-overlapping poller
+repeats Sync Now. The remote poll interval defaults to `300` seconds and must be
+at least `60` seconds.
 
 Validation reads and checks the source pair but does not install it. Sync Now
 validates the source, validates the existing destination when present, compares
@@ -224,11 +282,30 @@ It shows:
 - One card per configured certificate with domain, issuer, expiry, last sync,
   fingerprints, and key match status.
 - Buttons to edit, validate, sync now, and add/remove certificates.
+- Aggregate remote counts: `remote_sources`, `remote_connected`,
+  `remote_checking`, and `remote_errors`.
 
 Source validation, destination validation, synchronization, and watcher errors
 are tracked independently. An enabled entry is Healthy only when its source and
 destination have validated matching bundle digests. Disabled entries remain
 visible, count as Disabled, and do not degrade aggregate health.
+
+Remote entries add a separate **Cert Warden API** status group. In the
+`cert_warden_query` object, `status` is `Unknown`, `Healthy`, or `Error`, and
+`in_progress` drives the UI's Checking state. The group also reports
+`last_attempt`, `last_success`, `next_attempt`, `latency_ms`, `http_status`,
+`failure_kind`, and a sanitized `message`. Query health describes retrieval
+only; the **Source certificate** and **Zoraxy destination** groups independently
+show validation and installation health.
+
+`failure_kind` uses these categories:
+
+- `network`, `tls`, or `timeout` for transport failures.
+- `authentication` for HTTP 401/403, `not_found` for HTTP 404, and `server` for
+  HTTP 5xx.
+- `response_too_large` for responses over 1 MiB.
+- `invalid_response` for redirects, other unexpected status codes, or invalid
+  or incomplete PEM material.
 
 ## Logs
 
@@ -257,11 +334,29 @@ Run filesystem integration tests for sync and watcher behavior:
 make integration-test
 ```
 
+Run the focused Cert Warden client, secret-store, and HTTPS mock tests:
+
+```bash
+make certwarden-api-test
+```
+
 Run E2E tests with Playwright:
 
 ```bash
 make e2e-test
 ```
+
+Run the remote-source Playwright suite:
+
+```bash
+make e2e-remote-test
+```
+
+Remote tests use `tests/certwardenmock`: an HTTPS data endpoint with a generated
+test CA and a separate HTTP control endpoint that switches among valid renewal,
+authentication, not-found, server-error, malformed, mismatched, slow, and
+oversized-response scenarios. The test Zoraxy container mounts that CA and sets
+`SSL_CERT_FILE`; production deployments must provide their own trusted CA.
 
 Run the E2E suite against a different Zoraxy version:
 
@@ -320,8 +415,8 @@ hotfix flows are preferred.
 This repository uses GitHub Actions. See `.github/workflows/`.
 
 - **CI** (`ci.yml`) — runs formatting, unit, race, vet, static analysis,
-  repeated watcher/sync, filesystem integration, and cross-architecture build
-  gates on every PR and push to `main` and `develop`.
+  repeated watcher/sync, filesystem and Cert Warden API integration, and
+  cross-architecture build gates on every PR and push to `main` and `develop`.
 - **Compatibility** (`compatibility.yml`) — runs Playwright through Zoraxy for
   every stable version below, with nonblocking prerelease/latest canaries.
 - **Release** (`release.yml`) — reruns all quality and stable E2E gates, builds
@@ -347,6 +442,14 @@ passing those jobs does not make those versions supported releases.
 Ensure the Cert Warden Client volume is mounted read-only and the configured
 paths are correct.
 
+### Cert Warden API query failed
+
+Use `failure_kind`, `http_status`, and the query timestamps in the Cert Warden
+API status group. Confirm that both per-certificate keys are current, the server
+URL is an HTTPS origin, DNS/network access works from the Zoraxy container, and
+the server certificate is valid for that hostname. For a private CA, mount its
+CA bundle and set `SSL_CERT_FILE`; do not disable TLS verification.
+
 ### Certificate and private key do not match
 
 Cert Warden Client writes both files. If you see this error, the files may be
@@ -369,12 +472,21 @@ store. In Docker, this is usually the same user running the Zoraxy container.
 
 - Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
 - Private keys are never logged or returned by the API.
+- Cert Warden API keys are stored in `secrets.json` with mode `0600` and are
+  write-only through the UI/API.
 - Key files are written with mode `0600`.
 - Certificate files are written with mode `0644`.
 - Paths are validated to prevent directory traversal.
 - Certificate names are sanitized.
 - The plugin listens only on `127.0.0.1` and is reached through Zoraxy's
   authenticated management interface.
+- Remote server configuration intentionally accepts any syntactically valid
+  HTTPS host, including loopback, private, link-local, and internal DNS names.
+  This supports private Cert Warden deployments but creates an SSRF/internal-
+  service access risk if an administrator configures a hostile endpoint. Limit
+  Zoraxy administration to trusted operators and restrict container egress when
+  appropriate. Configuration changes require Zoraxy-authenticated management
+  access and its CSRF token, but those controls do not replace network policy.
 
 ## License
 

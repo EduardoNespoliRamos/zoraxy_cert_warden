@@ -34,7 +34,7 @@
             </div>
         </section>
 
-        <div id="modal" class="modal hidden">
+        <div id="modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="modal-title">
             <div class="modal-content">
                 <button type="button" class="close" aria-label="Close">&times;</button>
                 <h2 id="modal-title">Edit Certificate</h2>
@@ -49,13 +49,44 @@
                         Enabled
                     </label>
                     <label>
-                        Source Certificate
-                        <input type="text" id="cert-source-cert" required>
+                        Source Type
+                        <select id="cert-source-type">
+                            <option value="local">Local files</option>
+                            <option value="cert_warden">Cert Warden API</option>
+                        </select>
                     </label>
-                    <label>
-                        Source Private Key
-                        <input type="text" id="cert-source-key" required>
-                    </label>
+                    <fieldset id="local-source-fields" class="form-group">
+                        <legend>Local source</legend>
+                        <label>
+                            Source Certificate
+                            <input type="text" id="cert-source-cert" required>
+                        </label>
+                        <label>
+                            Source Private Key
+                            <input type="text" id="cert-source-key" required>
+                        </label>
+                    </fieldset>
+                    <fieldset id="cert-warden-source-fields" class="form-group" hidden>
+                        <legend>Cert Warden source</legend>
+                        <label>
+                            Server URL
+                            <input type="url" id="cert-warden-server-url" data-source-field="server_url" placeholder="https://certwarden.example.com">
+                        </label>
+                        <label>
+                            Certificate Name
+                            <input type="text" id="cert-warden-certificate-name" data-source-field="certificate_name">
+                        </label>
+                        <label>
+                            Certificate API Key
+                            <input type="password" id="cert-warden-certificate-api-key" data-source-field="certificate_api_key" autocomplete="new-password" aria-describedby="certificate-api-key-help">
+                            <span id="certificate-api-key-help" class="field-help"></span>
+                        </label>
+                        <label>
+                            Private Key API Key
+                            <input type="password" id="cert-warden-private-key-api-key" data-source-field="private_key_api_key" autocomplete="new-password" aria-describedby="private-key-api-key-help">
+                            <span id="private-key-api-key-help" class="field-help"></span>
+                        </label>
+                    </fieldset>
                     <label>
                         Target Directory
                         <input type="text" id="cert-target-dir" required>
@@ -87,7 +118,7 @@
                         <button type="button" id="btn-delete" class="btn btn-danger">Delete</button>
                     </div>
                 </form>
-                <div id="modal-message" class="message hidden"></div>
+                <div id="modal-message" class="message hidden" aria-live="polite"></div>
             </div>
         </div>
     </div>

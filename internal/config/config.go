@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -12,18 +13,35 @@ import (
 )
 
 const (
-	DefaultSourceCertificate = "/cert_warden_plugin/certchain0.pem"
-	DefaultSourcePrivateKey  = "/cert_warden_plugin/key0.pem"
-	DefaultTargetDirectory   = "/opt/zoraxy/config/conf/certs"
-	DefaultPollInterval      = 10
-	MinPollIntervalSeconds   = 1
-	MaxPollIntervalSeconds   = 86400
+	DefaultSourceCertificate     = "/cert_warden_plugin/certchain0.pem"
+	DefaultSourcePrivateKey      = "/cert_warden_plugin/key0.pem"
+	DefaultTargetDirectory       = "/opt/zoraxy/config/conf/certs"
+	DefaultPollInterval          = 10
+	DefaultRemotePollInterval    = 300
+	MinPollIntervalSeconds       = 1
+	MinRemotePollIntervalSeconds = 60
+	MaxPollIntervalSeconds       = 86400
 )
 
-// CertificateSource holds paths to the source certificate files.
+type SourceType string
+
+const (
+	SourceTypeLocal      SourceType = "local"
+	SourceTypeCertWarden SourceType = "cert_warden"
+)
+
+// CertWardenSource identifies material available from a Cert Warden server.
+type CertWardenSource struct {
+	ServerURL       string `json:"server_url"`
+	CertificateName string `json:"certificate_name"`
+}
+
+// CertificateSource selects either local files or the Cert Warden API.
 type CertificateSource struct {
-	Certificate string `json:"certificate"`
-	PrivateKey  string `json:"private_key"`
+	Type        SourceType        `json:"type,omitempty"`
+	Certificate string            `json:"certificate,omitempty"`
+	PrivateKey  string            `json:"private_key,omitempty"`
+	CertWarden  *CertWardenSource `json:"cert_warden,omitempty"`
 }
 
 // CertificateDestination holds the target location for synced files.
@@ -90,12 +108,23 @@ func (c *CertificateConfig) Normalize() {
 		return
 	}
 	c.Name = strings.TrimSpace(c.Name)
+	if c.Source.Type == "" {
+		c.Source.Type = SourceTypeLocal
+	}
 	c.Source.Certificate = strings.TrimSpace(c.Source.Certificate)
 	c.Source.PrivateKey = strings.TrimSpace(c.Source.PrivateKey)
+	if c.Source.CertWarden != nil {
+		c.Source.CertWarden.ServerURL = strings.TrimSpace(c.Source.CertWarden.ServerURL)
+		c.Source.CertWarden.CertificateName = strings.TrimSpace(c.Source.CertWarden.CertificateName)
+	}
 	c.Destination.TargetDirectory = strings.TrimSpace(c.Destination.TargetDirectory)
 	c.Destination.TargetName = strings.TrimSpace(c.Destination.TargetName)
 	if c.Sync.PollIntervalSeconds == 0 {
-		c.Sync.PollIntervalSeconds = DefaultPollInterval
+		if c.Source.Type == SourceTypeCertWarden {
+			c.Sync.PollIntervalSeconds = DefaultRemotePollInterval
+		} else {
+			c.Sync.PollIntervalSeconds = DefaultPollInterval
+		}
 	}
 }
 
@@ -124,19 +153,46 @@ func (c *CertificateConfig) validate(checkPaths bool, policy *PathPolicy) (strin
 		return "", fmt.Errorf("certificate name contains invalid characters")
 	}
 
-	if err := validatePath(c.Source.Certificate, "source certificate"); err != nil {
-		return "", err
-	}
-	_, err := policy.ResolveSource(c.Source.Certificate, checkPaths)
-	if err != nil {
-		return "", fmt.Errorf("source certificate: %w", err)
-	}
-	if err := validatePath(c.Source.PrivateKey, "source private key"); err != nil {
-		return "", err
-	}
-	_, err = policy.ResolveSource(c.Source.PrivateKey, checkPaths)
-	if err != nil {
-		return "", fmt.Errorf("source private key: %w", err)
+	switch c.Source.Type {
+	case SourceTypeLocal:
+		if c.Source.CertWarden != nil {
+			return "", fmt.Errorf("remote source settings are not allowed for a local source")
+		}
+		if err := validatePath(c.Source.Certificate, "source certificate"); err != nil {
+			return "", err
+		}
+		_, err := policy.ResolveSource(c.Source.Certificate, checkPaths)
+		if err != nil {
+			return "", fmt.Errorf("source certificate: %w", err)
+		}
+		if err := validatePath(c.Source.PrivateKey, "source private key"); err != nil {
+			return "", err
+		}
+		_, err = policy.ResolveSource(c.Source.PrivateKey, checkPaths)
+		if err != nil {
+			return "", fmt.Errorf("source private key: %w", err)
+		}
+	case SourceTypeCertWarden:
+		if c.Source.Certificate != "" || c.Source.PrivateKey != "" {
+			return "", fmt.Errorf("local file paths are not allowed for a Cert Warden source")
+		}
+		if c.Source.CertWarden == nil {
+			return "", fmt.Errorf("remote source settings are required")
+		}
+		if err := validateCertWardenOrigin(c.Source.CertWarden.ServerURL); err != nil {
+			return "", err
+		}
+		if c.Source.CertWarden.CertificateName == "" {
+			return "", fmt.Errorf("remote certificate name is required")
+		}
+		if strings.ContainsAny(c.Source.CertWarden.CertificateName, "\r\n") {
+			return "", fmt.Errorf("remote certificate name contains invalid characters")
+		}
+		if c.Sync.FilesystemWatch {
+			return "", fmt.Errorf("filesystem watch is not supported for a Cert Warden source")
+		}
+	default:
+		return "", fmt.Errorf("unsupported source type: %q", c.Source.Type)
 	}
 
 	if c.Destination.TargetDirectory == "" {
@@ -166,8 +222,19 @@ func (c *CertificateConfig) validate(checkPaths bool, policy *PathPolicy) (strin
 	if c.Sync.PollIntervalSeconds < MinPollIntervalSeconds || c.Sync.PollIntervalSeconds > MaxPollIntervalSeconds {
 		return "", fmt.Errorf("poll interval must be between %d and %d seconds", MinPollIntervalSeconds, MaxPollIntervalSeconds)
 	}
+	if c.Source.Type == SourceTypeCertWarden && c.Sync.PollIntervalSeconds < MinRemotePollIntervalSeconds {
+		return "", fmt.Errorf("remote poll interval must be between %d and %d seconds", MinRemotePollIntervalSeconds, MaxPollIntervalSeconds)
+	}
 
 	return resolvedDestination, nil
+}
+
+func validateCertWardenOrigin(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || strings.Contains(raw, "#") || u.Opaque != "" || (u.Path != "" && u.Path != "/") {
+		return fmt.Errorf("server URL: must be an HTTPS origin for Cert Warden")
+	}
+	return nil
 }
 
 func validatePath(path, label string) error {
@@ -258,6 +325,12 @@ func (cfg *Config) Clone() *Config {
 	clone := *cfg
 	if cfg.Certificates != nil {
 		clone.Certificates = append([]CertificateConfig(nil), cfg.Certificates...)
+		for i := range clone.Certificates {
+			if cfg.Certificates[i].Source.CertWarden != nil {
+				remote := *cfg.Certificates[i].Source.CertWarden
+				clone.Certificates[i].Source.CertWarden = &remote
+			}
+		}
 	}
 	return &clone
 }

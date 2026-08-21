@@ -8,8 +8,9 @@ VERSION ?= dev
 LDFLAGS := -s -w -X main.Version=$(VERSION)
 STATICCHECK_VERSION := v0.7.0
 GOVULNCHECK_VERSION := v1.7.0
+ACTIONLINT_VERSION := v1.7.7
 
-.PHONY: all fmt-check test race vet staticcheck govulncheck repeat-test quality build build-amd64 build-arm64 build-all verify-version integration-test e2e-test clean
+.PHONY: all fmt-check test race vet staticcheck govulncheck actionlint repeat-test certwarden-api-test quality build build-amd64 build-arm64 build-all verify-version integration-test e2e-test e2e-remote-test e2e-clean clean
 
 all: test build-all
 
@@ -31,10 +32,16 @@ staticcheck:
 govulncheck:
 	$(DOCKER) run --rm -v "$(ROOT):/src" -w /src $(GO_IMAGE) sh -c 'go install golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) && govulncheck ./...'
 
+actionlint:
+	$(DOCKER) run --rm -v "$(ROOT):/src" -w /src $(GO_IMAGE) sh -c 'go install github.com/rhysd/actionlint/cmd/actionlint@$(ACTIONLINT_VERSION) && actionlint'
+
 repeat-test:
 	$(DOCKER) run --rm -v "$(ROOT):/src" -w /src $(GO_IMAGE) go test -count=50 ./internal/watcher ./internal/sync
 
-quality: fmt-check test race vet staticcheck govulncheck repeat-test
+certwarden-api-test:
+	$(DOCKER) run --rm -v "$(ROOT):/src" -w /src $(GO_IMAGE) go test ./internal/certwarden ./internal/secretstore ./tests/certwardenmock
+
+quality: fmt-check test race vet staticcheck govulncheck actionlint repeat-test certwarden-api-test
 
 build:
 	mkdir -p dist
@@ -64,11 +71,17 @@ integration-test:
 	$(DOCKER) run --rm zoraxy-cert-warden-integration
 
 e2e-test:
-	ZORAXY_VERSION=$(ZORAXY_VERSION) $(DOCKER) compose -f tests/docker/docker-compose.test.yml up --build --abort-on-container-exit e2e
+	ZORAXY_VERSION=$(ZORAXY_VERSION) E2E_SUITE=$${E2E_SUITE:-compatibility} $(DOCKER) compose -f tests/docker/docker-compose.test.yml up --build --abort-on-container-exit --exit-code-from e2e e2e
+
+e2e-remote-test:
+	E2E_SUITE=certwarden-api $(MAKE) e2e-test
+
+e2e-clean:
+	$(DOCKER) compose -f tests/docker/docker-compose.test.yml down -v
 
 integration-test-shell:
 	ZORAXY_VERSION=$(ZORAXY_VERSION) $(DOCKER) compose -f tests/docker/docker-compose.test.yml up --build -d zoraxy
 
 clean:
 	rm -rf dist tmp
-	$(DOCKER) compose -f tests/docker/docker-compose.test.yml down -v
+	$(MAKE) e2e-clean
