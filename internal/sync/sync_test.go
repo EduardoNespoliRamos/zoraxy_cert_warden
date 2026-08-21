@@ -287,11 +287,25 @@ func TestAtomicWriteRejectsDestinationOutsidePolicy(t *testing.T) {
 	}
 }
 
-func TestWriteFallback(t *testing.T) {
+func TestEnsureFallback(t *testing.T) {
 	dir := t.TempDir()
 	policy := syncTestPolicy(t, dir, dir)
-	if err := WriteFallback(dir, "homealone-wildcard", policy); err != nil {
+	desired := "homealone-wildcard"
+	changed, err := EnsureFallback(dir, &desired, policy)
+	if err != nil || !changed {
 		t.Fatal(err)
+	}
+	info, err := os.Stat(filepath.Join(dir, "fallback.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed, err = EnsureFallback(dir, &desired, policy)
+	if err != nil || changed {
+		t.Fatalf("unchanged fallback was rewritten: changed=%v err=%v", changed, err)
+	}
+	infoAfter, err := os.Stat(filepath.Join(dir, "fallback.json"))
+	if err != nil || !info.ModTime().Equal(infoAfter.ModTime()) {
+		t.Fatalf("fallback modification time changed: %v", err)
 	}
 	name, err := ReadFallback(dir, policy)
 	if err != nil {
@@ -299,6 +313,45 @@ func TestWriteFallback(t *testing.T) {
 	}
 	if name != "homealone-wildcard" {
 		t.Fatalf("unexpected fallback name: %s", name)
+	}
+	changed, err = EnsureFallback(dir, nil, policy)
+	if err != nil || !changed {
+		t.Fatalf("fallback was not removed: changed=%v err=%v", changed, err)
+	}
+	changed, err = EnsureFallback(dir, nil, policy)
+	if err != nil || changed {
+		t.Fatalf("missing fallback removal was not idempotent: changed=%v err=%v", changed, err)
+	}
+}
+
+func TestEnsureFallbackReplacesInvalidFile(t *testing.T) {
+	dir := t.TempDir()
+	policy := syncTestPolicy(t, dir, dir)
+	mustWrite(t, filepath.Join(dir, "fallback.json"), []byte("not-json"), 0644)
+	desired := "replacement"
+	changed, err := EnsureFallback(dir, &desired, policy)
+	if err != nil || !changed {
+		t.Fatalf("invalid fallback was not replaced: changed=%v err=%v", changed, err)
+	}
+	if got, err := ReadFallback(dir, policy); err != nil || got != desired {
+		t.Fatalf("unexpected fallback: %q, %v", got, err)
+	}
+}
+
+func TestEnsureFallbackRejectsSymlinkAndOutsidePolicy(t *testing.T) {
+	dir, outside := t.TempDir(), t.TempDir()
+	policy := syncTestPolicy(t, dir, dir)
+	target := filepath.Join(outside, "target.json")
+	mustWrite(t, target, []byte(`{"fallbackCert":"old"}`), 0644)
+	if err := os.Symlink(target, filepath.Join(dir, "fallback.json")); err != nil {
+		t.Fatal(err)
+	}
+	desired := "new"
+	if _, err := EnsureFallback(dir, &desired, policy); err == nil {
+		t.Fatal("expected fallback symlink to be rejected")
+	}
+	if _, err := EnsureFallback(outside, &desired, policy); err == nil {
+		t.Fatal("expected destination outside policy to be rejected")
 	}
 }
 

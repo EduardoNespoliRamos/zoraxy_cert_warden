@@ -15,8 +15,9 @@ import (
 )
 
 type testManager struct {
-	mu  sync.Mutex
-	cfg *config.Config
+	mu      sync.Mutex
+	cfg     *config.Config
+	pending bool
 }
 
 func (m *testManager) SnapshotConfig() *config.Config {
@@ -43,6 +44,17 @@ func (m *testManager) MutateConfig(_ context.Context, mutation ConfigMutation) e
 }
 func (m *testManager) SyncCertificate(string) error     { return nil }
 func (m *testManager) ValidateCertificate(string) error { return nil }
+func (m *testManager) FallbackRestartPending() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.pending
+}
+func (m *testManager) AcknowledgeFallbackRestart(context.Context) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.pending = false
+	return nil
+}
 
 func TestConcurrentCertificateCreatesDoNotLoseUpdates(t *testing.T) {
 	manager := &testManager{cfg: &config.Config{LogLevel: "info"}}
@@ -63,5 +75,20 @@ func TestConcurrentCertificateCreatesDoNotLoseUpdates(t *testing.T) {
 	wg.Wait()
 	if got := len(manager.SnapshotConfig().Certificates); got != 20 {
 		t.Fatalf("expected 20 certificates, got %d", got)
+	}
+}
+
+func TestFallbackRestartAcknowledgeRoutes(t *testing.T) {
+	for _, path := range []string{"/api/fallback/restart/acknowledge", "/ui/api/fallback/restart/acknowledge"} {
+		manager := &testManager{cfg: &config.Config{LogLevel: "info"}, pending: true}
+		mux := http.NewServeMux()
+		server := NewServer(manager)
+		server.RegisterRoutes(mux, "/ui")
+		server.RegisterRoutesUnderPrefix(mux, "/ui")
+		response := httptest.NewRecorder()
+		mux.ServeHTTP(response, httptest.NewRequest(http.MethodPost, path, nil))
+		if response.Code != http.StatusOK || manager.FallbackRestartPending() {
+			t.Fatalf("acknowledge failed for %s: code=%d body=%s", path, response.Code, response.Body.String())
+		}
 	}
 }

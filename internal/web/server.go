@@ -28,6 +28,8 @@ type Manager interface {
 	MutateConfig(context.Context, ConfigMutation) error
 	SyncCertificate(string) error
 	ValidateCertificate(string) error
+	FallbackRestartPending() bool
+	AcknowledgeFallbackRestart(context.Context) error
 }
 
 // Server provides HTTP handlers for the plugin UI and API.
@@ -47,6 +49,7 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux, uiPath string) {
 	mux.HandleFunc("/api/config", s.handleConfig)
 	mux.HandleFunc("/api/certificates", s.handleCertificates)
 	mux.HandleFunc("/api/certificates/", s.handleCertificateDetail)
+	mux.HandleFunc("/api/fallback/restart/acknowledge", s.handleFallbackRestartAcknowledge)
 }
 
 // RegisterRoutesUnderPrefix registers the same routes under the UI proxy path.
@@ -56,6 +59,7 @@ func (s *Server) RegisterRoutesUnderPrefix(mux *http.ServeMux, prefix string) {
 	mux.HandleFunc(prefix+"/api/config", s.handleConfig)
 	mux.HandleFunc(prefix+"/api/certificates", s.handleCertificates)
 	mux.HandleFunc(prefix+"/api/certificates/", s.handleCertificateDetail)
+	mux.HandleFunc(prefix+"/api/fallback/restart/acknowledge", s.handleFallbackRestartAcknowledge)
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -82,7 +86,19 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) aggregate() status.AggregatedStatus {
-	return status.Aggregate(s.manager.SnapshotStatus())
+	return status.Aggregate(s.manager.SnapshotStatus(), s.manager.FallbackRestartPending())
+}
+
+func (s *Server) handleFallbackRestartAcknowledge(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := s.manager.AcknowledgeFallbackRestart(r.Context()); err != nil {
+		s.sendError(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	sendOK(w)
 }
 
 func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {

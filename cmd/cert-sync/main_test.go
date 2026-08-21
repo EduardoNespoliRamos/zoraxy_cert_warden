@@ -297,3 +297,112 @@ func TestValidationDoesNotClearSyncError(t *testing.T) {
 		t.Fatalf("validation erased sync error: %+v", got)
 	}
 }
+
+func TestApplyConfigReconcilesFallbackTransitions(t *testing.T) {
+	policy, source, destinationRoot := testPolicy(t)
+	for _, test := range []struct {
+		name       string
+		mutate     func(*config.Config, string)
+		wantOld    string
+		wantNew    string
+		wantItems  int
+		newDirName string
+	}{
+		{name: "delete", mutate: func(cfg *config.Config, _ string) { cfg.Certificates = nil }, wantItems: 0},
+		{name: "disable", mutate: func(cfg *config.Config, _ string) { cfg.Certificates[0].Enabled = false }, wantItems: 1},
+		{name: "rename", mutate: func(cfg *config.Config, _ string) { cfg.Certificates[0].Destination.TargetName = "renamed" }, wantNew: "renamed", wantItems: 1},
+		{name: "move", mutate: func(cfg *config.Config, root string) {
+			cfg.Certificates[0].Destination.TargetDirectory = filepath.Join(root, "moved")
+		}, wantNew: "fallback", wantItems: 1, newDirName: "moved"},
+		{name: "switch", mutate: func(cfg *config.Config, _ string) {
+			cfg.Certificates[0].Fallback = false
+			second := cfg.Certificates[0]
+			second.Name = "second"
+			second.Destination.TargetName = "second"
+			second.Fallback = true
+			cfg.Certificates = append(cfg.Certificates, second)
+		}, wantNew: "second", wantItems: 2},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			destination := filepath.Join(destinationRoot, test.name)
+			certificate := testCertificate("fallback", source, destination)
+			certificate.Fallback = true
+			m := inertManager(policy)
+			m.configPath = filepath.Join(t.TempDir(), "config.json")
+			initial := &config.Config{LogLevel: "info", Certificates: []config.CertificateConfig{certificate}}
+			if err := m.ApplyConfig(context.Background(), initial); err != nil {
+				t.Fatal(err)
+			}
+			if err := m.AcknowledgeFallbackRestart(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			updated := initial.Clone()
+			test.mutate(updated, destinationRoot)
+			if err := m.ApplyConfig(context.Background(), updated); err != nil {
+				t.Fatal(err)
+			}
+			if !m.FallbackRestartPending() {
+				t.Fatal("fallback change did not set pending restart")
+			}
+			if got := len(m.SnapshotStatus()); got != test.wantItems {
+				t.Fatalf("got %d status items, want %d", got, test.wantItems)
+			}
+			oldPath := filepath.Join(destination, "fallback.json")
+			if test.wantNew == "" || test.newDirName != "" {
+				if _, err := os.Stat(oldPath); !os.IsNotExist(err) {
+					t.Fatalf("old fallback remains: %v", err)
+				}
+			}
+			if test.wantNew != "" {
+				newDestination := destination
+				if test.newDirName != "" {
+					newDestination = filepath.Join(destinationRoot, test.newDirName)
+				}
+				if got, err := certSync.ReadFallback(newDestination, policy); err != nil || got != test.wantNew {
+					t.Fatalf("fallback = %q, %v; want %q", got, err, test.wantNew)
+				}
+			}
+		})
+	}
+}
+
+func TestFallbackPendingPersistsUntilAcknowledged(t *testing.T) {
+	policy, source, destination := testPolicy(t)
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	certificate := testCertificate("fallback", source, destination)
+	certificate.Fallback = true
+	cfg := &config.Config{LogLevel: "info", Certificates: []config.CertificateConfig{certificate}}
+
+	first := inertManager(policy)
+	first.configPath = configPath
+	if err := first.ApplyConfig(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	if !first.FallbackRestartPending() || !first.SnapshotStatus()[0].FallbackPendingRestart {
+		t.Fatal("initial fallback write did not set pending state")
+	}
+
+	second := inertManager(policy)
+	second.configPath = configPath
+	if err := second.ApplyConfig(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	if !second.FallbackRestartPending() || !second.SnapshotStatus()[0].FallbackPendingRestart {
+		t.Fatal("pending state did not survive manager restart or unchanged sync")
+	}
+	if err := second.AcknowledgeFallbackRestart(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if second.FallbackRestartPending() || second.SnapshotStatus()[0].FallbackPendingRestart {
+		t.Fatal("acknowledgment did not clear pending state")
+	}
+
+	third := inertManager(policy)
+	third.configPath = configPath
+	if err := third.ApplyConfig(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	if third.FallbackRestartPending() || third.SnapshotStatus()[0].FallbackPendingRestart {
+		t.Fatal("acknowledgment did not persist")
+	}
+}

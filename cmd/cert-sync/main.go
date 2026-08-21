@@ -3,7 +3,10 @@ package main
 import (
 	"context"
 	"embed"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"os"
@@ -48,6 +51,10 @@ type manager struct {
 	destinationMu    sync.Mutex
 	destinationLocks map[string]*sync.Mutex
 	defaultsOnce     sync.Once
+	fallbackMu       sync.Mutex
+	fallbackApplyMu  sync.RWMutex
+	fallbackPending  map[string]bool
+	runtimeLoaded    bool
 
 	saveConfig          func(*config.Config, string, *config.PathPolicy) error
 	watcherFactory      func([]string, time.Duration, time.Duration, bool, func(), *config.PathPolicy) (managedWatcher, error)
@@ -240,6 +247,10 @@ func (m *manager) applyConfigLocked(ctx context.Context, candidate *config.Confi
 	if err := staged.Validate(false, m.policy); err != nil {
 		return configValidationError{err: err}
 	}
+	if err := m.loadRuntimeState(); err != nil {
+		return err
+	}
+	oldConfig := m.SnapshotConfig()
 
 	m.mu.RLock()
 	generation := m.generation + 1
@@ -275,9 +286,32 @@ func (m *manager) applyConfigLocked(ctx context.Context, candidate *config.Confi
 		stopWatchers(newWatchers)
 		return err
 	}
-	if err := m.saveConfig(staged, m.configPath, m.policy); err != nil {
+	m.fallbackApplyMu.Lock()
+	changedDestinations, err := m.reconcileFallbacks(oldConfig, staged)
+	if err != nil {
+		_, rollbackErr := m.reconcileFallbacks(staged, oldConfig)
+		m.fallbackApplyMu.Unlock()
 		stopWatchers(newWatchers)
-		return err
+		return errors.Join(err, rollbackErr)
+	}
+	if err := m.saveConfig(staged, m.configPath, m.policy); err != nil {
+		_, rollbackErr := m.reconcileFallbacks(staged, oldConfig)
+		m.fallbackApplyMu.Unlock()
+		stopWatchers(newWatchers)
+		return errors.Join(err, rollbackErr)
+	}
+	if pendingErr := m.markFallbackPending(changedDestinations...); pendingErr != nil {
+		configRollbackErr := m.saveConfig(oldConfig, m.configPath, m.policy)
+		_, fallbackRollbackErr := m.reconcileFallbacks(staged, oldConfig)
+		m.fallbackApplyMu.Unlock()
+		stopWatchers(newWatchers)
+		return errors.Join(pendingErr, configRollbackErr, fallbackRollbackErr)
+	}
+	for _, state := range newStates {
+		if state.Config.Fallback {
+			destination, resolveErr := m.policy.ResolveDestination(state.Config.Destination.TargetDirectory, false)
+			state.FallbackPendingRestart = resolveErr == nil && m.fallbackPendingFor(destination)
+		}
 	}
 
 	m.mu.Lock()
@@ -287,6 +321,7 @@ func (m *manager) applyConfigLocked(ctx context.Context, candidate *config.Confi
 	m.watchers = newWatchers
 	m.generation = generation
 	m.mu.Unlock()
+	m.fallbackApplyMu.Unlock()
 
 	stopWatchers(oldWatchers)
 	for _, certCfg := range staged.Certificates {
@@ -318,10 +353,14 @@ func (m *manager) syncGeneration(name string, generation uint64) error {
 	}
 	cfg := state.Config
 	m.mu.RUnlock()
+	if cfg.Fallback {
+		m.fallbackApplyMu.RLock()
+		defer m.fallbackApplyMu.RUnlock()
+	}
 
 	destination, err := m.policy.ResolveDestination(cfg.Destination.TargetDirectory, false)
 	if err != nil {
-		m.recordSync(name, generation, nil, nil, time.Time{}, nil, err, false, err)
+		m.recordSync(name, generation, nil, nil, time.Time{}, nil, err, "", err)
 		return err
 	}
 	lock := m.destinationLock(filepath.Join(destination, cfg.Destination.TargetName))
@@ -345,19 +384,19 @@ func (m *manager) syncGeneration(name string, generation uint64) error {
 			cfg.Destination.TargetDirectory, cfg.Destination.TargetName, m.policy,
 		)
 	}
-	fallbackPending := false
-	if syncErr == nil && cfg.Fallback {
-		currentFallback, fallbackErr := certSync.ReadFallback(cfg.Destination.TargetDirectory, m.policy)
-		fallbackPending = fallbackErr != nil || currentFallback != cfg.Destination.TargetName
+	if result != nil && result.FallbackChanged {
+		if pendingErr := m.markFallbackPending(destination); pendingErr != nil {
+			syncErr = errors.Join(syncErr, fmt.Errorf("persist fallback restart state: %w", pendingErr))
+		}
 	}
-	m.recordSync(name, generation, info, result, modified, destinationInfo, destinationErr, fallbackPending, syncErr)
+	m.recordSync(name, generation, info, result, modified, destinationInfo, destinationErr, destination, syncErr)
 	if syncErr != nil {
 		m.logger.Error("cert-sync failed", "certificate", name, "error", syncErr)
 	}
 	return syncErr
 }
 
-func (m *manager) recordSync(name string, generation uint64, info *certutil.CertInfo, result *certSync.Result, modified time.Time, destinationInfo *certutil.CertInfo, destinationErr error, fallbackPending bool, syncErr error) {
+func (m *manager) recordSync(name string, generation uint64, info *certutil.CertInfo, result *certSync.Result, modified time.Time, destinationInfo *certutil.CertInfo, destinationErr error, fallbackDestination string, syncErr error) {
 	now := time.Now()
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -368,6 +407,7 @@ func (m *manager) recordSync(name string, generation uint64, info *certutil.Cert
 	state.LastAttemptedSync = &now
 	state.LastSourceModification = modified
 	state.SyncError = syncErr
+	state.FallbackPendingRestart = state.Config.Fallback && fallbackDestination != "" && m.fallbackPendingFor(fallbackDestination)
 	state.SourceInfo = info
 	if info == nil {
 		if destinationErr != nil {
@@ -399,7 +439,214 @@ func (m *manager) recordSync(name string, generation uint64, info *certutil.Cert
 	if state.DestinationFingerprint == "" {
 		state.DestinationFingerprint = result.DestFP
 	}
-	state.FallbackPendingRestart = state.Config.Fallback && fallbackPending
+}
+
+type runtimeState struct {
+	FallbackPendingRestart []string `json:"fallback_pending_restart"`
+}
+
+func (m *manager) runtimeStatePath() string {
+	if m.configPath == "" {
+		return ""
+	}
+	return m.configPath + ".runtime.json"
+}
+
+func (m *manager) loadRuntimeState() error {
+	m.fallbackMu.Lock()
+	defer m.fallbackMu.Unlock()
+	if m.runtimeLoaded {
+		return nil
+	}
+	m.fallbackPending = make(map[string]bool)
+	path := m.runtimeStatePath()
+	if path == "" {
+		m.runtimeLoaded = true
+		return nil
+	}
+	info, err := os.Lstat(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		m.runtimeLoaded = true
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect runtime state: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return fmt.Errorf("runtime state must be a regular file")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read runtime state: %w", err)
+	}
+	var persisted runtimeState
+	if err := json.Unmarshal(data, &persisted); err != nil {
+		return fmt.Errorf("parse runtime state: %w", err)
+	}
+	for _, destination := range persisted.FallbackPendingRestart {
+		resolved, err := m.policy.ResolveDestination(destination, false)
+		if err != nil || resolved != destination {
+			return fmt.Errorf("invalid runtime fallback destination %q", destination)
+		}
+		m.fallbackPending[destination] = true
+	}
+	m.runtimeLoaded = true
+	return nil
+}
+
+func (m *manager) saveRuntimeStateLocked(pending map[string]bool) error {
+	path := m.runtimeStatePath()
+	if path == "" {
+		return nil
+	}
+	destinations := make([]string, 0, len(pending))
+	for destination := range pending {
+		destinations = append(destinations, destination)
+	}
+	sort.Strings(destinations)
+	data, err := json.Marshal(runtimeState{FallbackPendingRestart: destinations})
+	if err != nil {
+		return err
+	}
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".runtime-state-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	ok := false
+	defer func() {
+		_ = tmp.Close()
+		if !ok {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if err := tmp.Chmod(0600); err != nil {
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return err
+	}
+	ok = true
+	directory, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer directory.Close()
+	return directory.Sync()
+}
+
+func (m *manager) markFallbackPending(destinations ...string) error {
+	if len(destinations) == 0 {
+		return nil
+	}
+	m.fallbackMu.Lock()
+	defer m.fallbackMu.Unlock()
+	next := make(map[string]bool, len(m.fallbackPending)+len(destinations))
+	for destination := range m.fallbackPending {
+		next[destination] = true
+	}
+	for _, destination := range destinations {
+		next[destination] = true
+	}
+	if err := m.saveRuntimeStateLocked(next); err != nil {
+		return err
+	}
+	m.fallbackPending = next
+	return nil
+}
+
+func (m *manager) fallbackPendingFor(destination string) bool {
+	m.fallbackMu.Lock()
+	defer m.fallbackMu.Unlock()
+	return m.fallbackPending[destination]
+}
+
+func (m *manager) FallbackRestartPending() bool {
+	m.fallbackMu.Lock()
+	defer m.fallbackMu.Unlock()
+	return len(m.fallbackPending) > 0
+}
+
+func (m *manager) AcknowledgeFallbackRestart(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	m.fallbackMu.Lock()
+	if len(m.fallbackPending) == 0 {
+		m.fallbackMu.Unlock()
+		return nil
+	}
+	if err := m.saveRuntimeStateLocked(map[string]bool{}); err != nil {
+		m.fallbackMu.Unlock()
+		return err
+	}
+	m.fallbackPending = make(map[string]bool)
+	m.fallbackMu.Unlock()
+	m.mu.Lock()
+	for _, state := range m.states {
+		state.FallbackPendingRestart = false
+	}
+	m.mu.Unlock()
+	return nil
+}
+
+func (m *manager) reconcileFallbacks(oldConfig, newConfig *config.Config) ([]string, error) {
+	directories := make(map[string]bool)
+	desired := make(map[string]string)
+	for _, cfg := range []*config.Config{oldConfig, newConfig} {
+		if cfg == nil {
+			continue
+		}
+		for _, certificate := range cfg.Certificates {
+			destination, err := m.policy.ResolveDestination(certificate.Destination.TargetDirectory, false)
+			if err != nil {
+				return nil, err
+			}
+			directories[destination] = true
+		}
+	}
+	if newConfig != nil {
+		for _, certificate := range newConfig.Certificates {
+			if !certificate.Enabled || !certificate.Fallback {
+				continue
+			}
+			destination, err := m.policy.ResolveDestination(certificate.Destination.TargetDirectory, false)
+			if err != nil {
+				return nil, err
+			}
+			desired[destination] = certificate.Destination.TargetName
+		}
+	}
+	ordered := make([]string, 0, len(directories))
+	for destination := range directories {
+		ordered = append(ordered, destination)
+	}
+	sort.Strings(ordered)
+	changed := make([]string, 0)
+	for _, destination := range ordered {
+		var wanted *string
+		if name, ok := desired[destination]; ok {
+			wanted = &name
+		}
+		wasChanged, err := certSync.EnsureFallback(destination, wanted, m.policy)
+		if wasChanged {
+			changed = append(changed, destination)
+		}
+		if err != nil {
+			return changed, err
+		}
+	}
+	return changed, nil
 }
 
 func (m *manager) ValidateCertificate(name string) error {

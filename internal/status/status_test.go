@@ -24,3 +24,10 @@ func TestDisabledDoesNotDegradeAggregate(t *testing.T) {
 		t.Fatalf("unexpected aggregate: %+v", agg)
 	}
 }
+
+func TestAggregateExposesPersistentFallbackRestart(t *testing.T) {
+	agg := Aggregate(nil, true)
+	if !agg.FallbackPendingRestart {
+		t.Fatal("aggregate did not expose pending fallback restart")
+	}
+}

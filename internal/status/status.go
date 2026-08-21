@@ -51,13 +51,14 @@ type CertificateStatus struct {
 
 // AggregatedStatus holds the overall plugin status.
 type AggregatedStatus struct {
-	Status       Status              `json:"status"`
-	Certificates int                 `json:"certificates"`
-	Healthy      int                 `json:"healthy"`
-	Errors       int                 `json:"errors"`
-	Unknown      int                 `json:"unknown"`
-	Disabled     int                 `json:"disabled"`
-	Items        []CertificateStatus `json:"items"`
+	Status                 Status              `json:"status"`
+	Certificates           int                 `json:"certificates"`
+	Healthy                int                 `json:"healthy"`
+	Errors                 int                 `json:"errors"`
+	Unknown                int                 `json:"unknown"`
+	Disabled               int                 `json:"disabled"`
+	FallbackPendingRestart bool                `json:"fallback_pending_restart"`
+	Items                  []CertificateStatus `json:"items"`
 }
 
 // State tracks independent validation, synchronization, and watcher results.
@@ -166,10 +167,14 @@ func errorString(err error) string {
 
 // Aggregate computes overall health. Disabled entries remain visible but do
 // not degrade the aggregate status.
-func Aggregate(items []CertificateStatus) AggregatedStatus {
+func Aggregate(items []CertificateStatus, persistentPending ...bool) AggregatedStatus {
 	agg := AggregatedStatus{Status: StatusHealthy, Items: items}
+	if len(persistentPending) > 0 {
+		agg.FallbackPendingRestart = persistentPending[0]
+	}
 	for _, item := range items {
 		agg.Certificates++
+		agg.FallbackPendingRestart = agg.FallbackPendingRestart || item.FallbackPendingRestart
 		switch item.Status {
 		case StatusHealthy:
 			agg.Healthy++

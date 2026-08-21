@@ -29,6 +29,7 @@ type Result struct {
 	SourceBundleDigest string
 	DestBundleDigest   string
 	Fallback           bool
+	FallbackChanged    bool
 	Error              error
 }
 
@@ -114,7 +115,9 @@ func Sync(cfg config.CertificateConfig, policy *config.PathPolicy) (*certutil.Ce
 		if destInfo.BundleDigest == certInfo.BundleDigest {
 			res.NoChanges = true
 			if cfg.Fallback {
-				if err := WriteFallback(destDir, destName, policy); err != nil {
+				changed, err := EnsureFallback(destDir, &destName, policy)
+				res.FallbackChanged = changed
+				if err != nil {
 					res.Error = err
 					return certInfo, res, err
 				}
@@ -133,7 +136,9 @@ func Sync(cfg config.CertificateConfig, policy *config.PathPolicy) (*certutil.Ce
 	res.DestBundleDigest = certInfo.BundleDigest
 
 	if cfg.Fallback {
-		if err := WriteFallback(destDir, destName, policy); err != nil {
+		changed, err := EnsureFallback(destDir, &destName, policy)
+		res.FallbackChanged = changed
+		if err != nil {
 			res.Error = err
 			return certInfo, res, err
 		}
@@ -416,25 +421,72 @@ func ReadDestinationInfo(destDir, destName string, policy *config.PathPolicy) (*
 	return readDestinationPair(destDir, destName, policy, osFilesystem)
 }
 
-// WriteFallback writes the fallback.json file used by Zoraxy.
-func WriteFallback(destDir, destName string, policy *config.PathPolicy) error {
+// EnsureFallback reconciles Zoraxy's fallback.json with the desired certificate.
+// A nil desired value removes the file. It reports whether durable state changed.
+func EnsureFallback(destDir string, desired *string, policy *config.PathPolicy) (bool, error) {
 	resolvedDir, err := policy.ResolveDestination(destDir, false)
 	if err != nil {
-		return err
+		return false, err
+	}
+	path := filepath.Join(resolvedDir, "fallback.json")
+	lockValue, _ := replacementLocks.LoadOrStore(path, &stdsync.Mutex{})
+	lock := lockValue.(*stdsync.Mutex)
+	lock.Lock()
+	defer lock.Unlock()
+
+	info, statErr := os.Lstat(path)
+	if statErr != nil && !errors.Is(statErr, fs.ErrNotExist) {
+		return false, fmt.Errorf("inspect fallback file: %w", statErr)
+	}
+	if statErr == nil && info.Mode()&os.ModeSymlink != 0 {
+		return false, fmt.Errorf("refusing to modify symlink: %s", path)
+	}
+
+	if desired == nil {
+		if errors.Is(statErr, fs.ErrNotExist) {
+			return false, nil
+		}
+		if err := os.Remove(path); err != nil {
+			return false, fmt.Errorf("remove fallback file: %w", err)
+		}
+		if err := osFilesystem.syncDir(resolvedDir); err != nil {
+			return true, fmt.Errorf("sync fallback directory: %w", err)
+		}
+		return true, nil
+	}
+	if *desired == "" || filepath.Base(*desired) != *desired {
+		return false, fmt.Errorf("fallback certificate name must be a non-empty basename")
+	}
+	if statErr == nil && info.Mode().IsRegular() && info.Mode().Perm() == fallbackFileMode {
+		data, readErr := os.ReadFile(path)
+		if readErr == nil {
+			var current struct {
+				FallbackCert string `json:"fallbackCert"`
+			}
+			if json.Unmarshal(data, &current) == nil && current.FallbackCert == *desired {
+				return false, nil
+			}
+		}
 	}
 	if err := os.MkdirAll(resolvedDir, 0755); err != nil {
-		return fmt.Errorf("failed to create target directory: %w", err)
+		return false, fmt.Errorf("failed to create target directory: %w", err)
 	}
-	data, err := json.Marshal(map[string]string{"fallbackCert": destName})
+	data, err := json.Marshal(map[string]string{"fallbackCert": *desired})
 	if err != nil {
-		return err
+		return false, err
 	}
 	tmp, err := writeTempFileFS(resolvedDir, ".fallback-*.json.tmp", data, fallbackFileMode, osFilesystem)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer os.Remove(tmp)
-	return os.Rename(tmp, filepath.Join(resolvedDir, "fallback.json"))
+	if err := os.Rename(tmp, path); err != nil {
+		return false, err
+	}
+	if err := osFilesystem.syncDir(resolvedDir); err != nil {
+		return true, fmt.Errorf("sync fallback directory: %w", err)
+	}
+	return true, nil
 }
 
 // ReadFallback reads the currently configured fallback certificate name.
