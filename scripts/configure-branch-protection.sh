@@ -2,9 +2,12 @@
 set -euo pipefail
 
 REPO="EduardoNespoliRamos/zoraxy_cert_warden"
-BRANCH="main"
 
-echo "Configuring branch protection rules for ${REPO}#${BRANCH}..."
+if [[ $# -eq 0 ]]; then
+  BRANCHES=(main develop)
+else
+  BRANCHES=("$@")
+fi
 
 # Note: the integration-matrix job from compatibility.yml is intentionally
 # NOT listed as a required status check. Because it uses a build matrix, GitHub
@@ -24,9 +27,17 @@ else
   RESTRICTIONS_JSON='"restrictions": null,'
 fi
 
-gh api "repos/${REPO}/branches/${BRANCH}/protection" \
-  --method PUT \
-  --input - <<EOF
+for BRANCH in "${BRANCHES[@]}"; do
+  if [[ "$BRANCH" != "main" && "$BRANCH" != "develop" ]]; then
+    echo "ERROR: Supported branches are main and develop. Received: $BRANCH" >&2
+    exit 1
+  fi
+
+  echo "Configuring branch protection rules for ${REPO}#${BRANCH}..."
+
+  gh api "repos/${REPO}/branches/${BRANCH}/protection" \
+    --method PUT \
+    --input - <<EOF
 {
   "required_status_checks": {
     "strict": true,
@@ -50,4 +61,5 @@ gh api "repos/${REPO}/branches/${BRANCH}/protection" \
 }
 EOF
 
-echo "Branch protection rules applied to ${REPO}#${BRANCH}"
+  echo "Branch protection rules applied to ${REPO}#${BRANCH}"
+done
