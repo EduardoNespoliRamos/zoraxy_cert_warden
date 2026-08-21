@@ -150,14 +150,16 @@ test('CRUD, status, manual sync, empty deletion, and path policy errors work thr
   await card.getByRole('button', { name: 'Sync Now' }).click();
   await expect(card.locator('h3 .status-healthy')).toContainText('Healthy');
 
-  page.once('dialog', dialog => dialog.accept());
   await card.getByRole('button', { name: 'Edit' }).click();
+  await page.locator('#btn-delete').click();
+  await expect(page.locator('#btn-delete')).toContainText('Confirm Delete');
   await page.locator('#btn-delete').click();
   await expect(card).toHaveCount(0);
 
   const defaultCard = page.locator('.cert-card[data-cert-name="example-certificate"]');
-  page.once('dialog', dialog => dialog.accept());
   await defaultCard.getByRole('button', { name: 'Edit' }).click();
+  await page.locator('#btn-delete').click();
+  await expect(page.locator('#btn-delete')).toContainText('Confirm Delete');
   await page.locator('#btn-delete').click();
   await expect(page.locator('#cert-list')).toContainText('No certificates configured.');
   await expect(page.locator('#overview-content')).toContainText('Configured certificates: 0');
