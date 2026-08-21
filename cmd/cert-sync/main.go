@@ -51,9 +51,9 @@ func main() {
 		Description:   "Synchronizes certificates from Cert Warden Client into Zoraxy TLS store.",
 		URL:           "https://github.com/EduardoNespoliRamos/zoraxy_cert_warden",
 		Type:          plugin.PluginType_Utilities,
-		VersionMajor:  1,
+		VersionMajor:  0,
 		VersionMinor:  0,
-		VersionPatch:  0,
+		VersionPatch:  1,
 		UIPath:        uiPath,
 		PermittedAPIEndpoints: []plugin.PermittedAPIEndpoint{
 			{Method: "GET", Endpoint: "/plugin.ui/com.eduardoramos.zoraxy.certwarden/api/status", Reason: "Read plugin status"},
