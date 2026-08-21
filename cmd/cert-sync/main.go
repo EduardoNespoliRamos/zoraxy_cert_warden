@@ -38,6 +38,9 @@ const (
 //go:embed web/css/style.css
 var content embed.FS
 
+// Version is replaced with the release tag version at build time.
+var Version = "dev"
+
 type manager struct {
 	mu         sync.RWMutex // protects only active snapshots and runtime handles
 	applyMu    sync.Mutex
@@ -47,6 +50,7 @@ type manager struct {
 	generation uint64
 	configPath string
 	logger     *slog.Logger
+	logLevel   *slog.LevelVar
 	policy     *config.PathPolicy
 
 	destinationMu    sync.Mutex
@@ -101,7 +105,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	logLevel := &slog.LevelVar{}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel}))
 
 	execPath, err := os.Executable()
 	if err != nil {
@@ -129,6 +134,7 @@ func main() {
 		watchers:   make(map[string]managedWatcher),
 		configPath: configPath,
 		logger:     logger,
+		logLevel:   logLevel,
 		policy:     policy,
 	}
 
@@ -173,6 +179,7 @@ func newHTTPServer(addr string, handler http.Handler) *http.Server {
 }
 
 func pluginSpec() *plugin.IntroSpect {
+	major, minor, patch := semanticVersion(Version)
 	return &plugin.IntroSpect{
 		ID:            pluginID,
 		Name:          "Zoraxy Cert Warden Sync",
@@ -181,11 +188,31 @@ func pluginSpec() *plugin.IntroSpect {
 		Description:   "Synchronizes certificates from Cert Warden Client into Zoraxy TLS store.",
 		URL:           "https://github.com/EduardoNespoliRamos/zoraxy_cert_warden",
 		Type:          plugin.PluginType_Utilities,
-		VersionMajor:  1,
-		VersionMinor:  0,
-		VersionPatch:  0,
+		VersionMajor:  major,
+		VersionMinor:  minor,
+		VersionPatch:  patch,
 		UIPath:        uiPath,
 	}
+}
+
+func semanticVersion(version string) (int, int, int) {
+	version = strings.TrimPrefix(version, "v")
+	parts := strings.Split(version, ".")
+	if len(parts) != 3 {
+		return 0, 0, 0
+	}
+	values := make([]int, 3)
+	for i, part := range parts {
+		if part == "" || (len(part) > 1 && part[0] == '0') {
+			return 0, 0, 0
+		}
+		value, err := strconv.Atoi(part)
+		if err != nil || value < 0 {
+			return 0, 0, 0
+		}
+		values[i] = value
+	}
+	return values[0], values[1], values[2]
 }
 
 func (m *manager) defaults() {
@@ -354,6 +381,7 @@ func (m *manager) applyConfigLocked(ctx context.Context, candidate *config.Confi
 	m.states = newStates
 	m.watchers = newWatchers
 	m.generation = generation
+	m.setLogLevel(staged.LogLevel)
 	m.mu.Unlock()
 	m.fallbackApplyMu.Unlock()
 
@@ -364,6 +392,22 @@ func (m *manager) applyConfigLocked(ctx context.Context, candidate *config.Confi
 		}
 	}
 	return nil
+}
+
+func (m *manager) setLogLevel(level string) {
+	if m.logLevel == nil {
+		return
+	}
+	switch level {
+	case "debug":
+		m.logLevel.Set(slog.LevelDebug)
+	case "warn":
+		m.logLevel.Set(slog.LevelWarn)
+	case "error":
+		m.logLevel.Set(slog.LevelError)
+	default:
+		m.logLevel.Set(slog.LevelInfo)
+	}
 }
 
 func isConfigConflict(err error) bool {

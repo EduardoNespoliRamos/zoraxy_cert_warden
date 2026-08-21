@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -21,6 +22,38 @@ func TestPluginSpecDoesNotRequestZoraxyAPIAccess(t *testing.T) {
 	spec := pluginSpec()
 	if len(spec.PermittedAPIEndpoints) != 0 {
 		t.Fatalf("expected no permitted Zoraxy API endpoints, got %d", len(spec.PermittedAPIEndpoints))
+	}
+}
+
+func TestPluginSpecUsesBuildVersion(t *testing.T) {
+	original := Version
+	t.Cleanup(func() { Version = original })
+	Version = "1.2.3"
+
+	spec := pluginSpec()
+	if spec.VersionMajor != 1 || spec.VersionMinor != 2 || spec.VersionPatch != 3 {
+		t.Fatalf("introspect version = %d.%d.%d, want 1.2.3", spec.VersionMajor, spec.VersionMinor, spec.VersionPatch)
+	}
+}
+
+func TestSemanticVersion(t *testing.T) {
+	for _, test := range []struct {
+		version             string
+		major, minor, patch int
+	}{
+		{version: "dev"},
+		{version: "1.2"},
+		{version: "1.2.3-rc1"},
+		{version: "01.2.3"},
+		{version: "v4.5.6", major: 4, minor: 5, patch: 6},
+		{version: "10.20.30", major: 10, minor: 20, patch: 30},
+	} {
+		t.Run(test.version, func(t *testing.T) {
+			major, minor, patch := semanticVersion(test.version)
+			if major != test.major || minor != test.minor || patch != test.patch {
+				t.Fatalf("semanticVersion(%q) = %d.%d.%d, want %d.%d.%d", test.version, major, minor, patch, test.major, test.minor, test.patch)
+			}
+		})
 	}
 }
 
@@ -143,6 +176,20 @@ func TestManagerSnapshotsAreDeepAndStatusIsSorted(t *testing.T) {
 	items := m.SnapshotStatus()
 	if len(items) != 2 || items[0].Name != "a" || items[1].Name != "b" {
 		t.Fatalf("status snapshot is not deterministic: %+v", items)
+	}
+}
+
+func TestApplyConfigUpdatesLogLevel(t *testing.T) {
+	policy, _, _ := testPolicy(t)
+	m := inertManager(policy)
+	level := &slog.LevelVar{}
+	m.logLevel = level
+
+	if err := m.ApplyConfig(context.Background(), &config.Config{LogLevel: "debug"}); err != nil {
+		t.Fatal(err)
+	}
+	if level.Level() != slog.LevelDebug {
+		t.Fatalf("logger level = %s, want debug", level.Level())
 	}
 }
 
