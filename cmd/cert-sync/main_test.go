@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sync"
@@ -20,6 +21,50 @@ func TestPluginSpecDoesNotRequestZoraxyAPIAccess(t *testing.T) {
 	spec := pluginSpec()
 	if len(spec.PermittedAPIEndpoints) != 0 {
 		t.Fatalf("expected no permitted Zoraxy API endpoints, got %d", len(spec.PermittedAPIEndpoints))
+	}
+}
+
+func TestHTTPServerHasLoopbackBindAndTimeouts(t *testing.T) {
+	handler := http.NewServeMux()
+	server := newHTTPServer("127.0.0.1:12345", handler)
+	if server.Addr != "127.0.0.1:12345" {
+		t.Fatalf("server address = %q", server.Addr)
+	}
+	if server.Handler != handler {
+		t.Fatal("server handler was not preserved")
+	}
+	if server.ReadHeaderTimeout <= 0 || server.ReadTimeout <= 0 || server.WriteTimeout <= 0 || server.IdleTimeout <= 0 {
+		t.Fatalf("server timeouts must be positive: read-header=%s read=%s write=%s idle=%s",
+			server.ReadHeaderTimeout, server.ReadTimeout, server.WriteTimeout, server.IdleTimeout)
+	}
+}
+
+func TestManagerErrorMarkers(t *testing.T) {
+	notFound := certificateNotFoundError{name: "missing"}
+	var missing interface{ NotFound() bool }
+	if !errors.As(notFound, &missing) || !missing.NotFound() {
+		t.Fatal("certificate-not-found error lacks marker")
+	}
+
+	invalid := sourceValidationError{err: errors.New("invalid PEM")}
+	var sourceInvalid interface{ SourceValidation() bool }
+	if !errors.As(invalid, &sourceInvalid) || !sourceInvalid.SourceValidation() {
+		t.Fatal("source-validation error lacks marker")
+	}
+}
+
+func TestConfigConflictClassification(t *testing.T) {
+	for _, message := range []string{
+		"duplicate certificate name: cert",
+		"duplicate destination: /destination/cert",
+		"multiple fallback certificates for destination directory: /destination",
+	} {
+		if !isConfigConflict(errors.New(message)) {
+			t.Fatalf("not classified as conflict: %s", message)
+		}
+	}
+	if isConfigConflict(errors.New("certificate name is required")) {
+		t.Fatal("invalid field was classified as conflict")
 	}
 }
 

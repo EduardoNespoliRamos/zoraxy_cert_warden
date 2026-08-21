@@ -4,12 +4,18 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"log/slog"
+	"mime"
 	"net/http"
+	"path"
 	"strings"
 
 	"github.com/eduardoramos/zoraxy-cert-warden/internal/config"
 	"github.com/eduardoramos/zoraxy-cert-warden/internal/status"
 )
+
+const maxRequestBodyBytes int64 = 64 << 10
 
 var (
 	errCertificateExists   = errors.New("certificate already exists")
@@ -35,54 +41,87 @@ type Manager interface {
 // Server provides HTTP handlers for the plugin UI and API.
 type Server struct {
 	manager Manager
+	logger  *slog.Logger
 }
 
 // NewServer creates a server backed only by manager service operations.
-func NewServer(manager Manager) *Server {
-	return &Server{manager: manager}
+func NewServer(manager Manager, logger ...*slog.Logger) *Server {
+	log := slog.Default()
+	if len(logger) > 0 && logger[0] != nil {
+		log = logger[0]
+	}
+	return &Server{manager: manager, logger: log}
+}
+
+// Handler rejects paths ServeMux would otherwise normalize and redirect.
+func (s *Server) Handler(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cleanPath := path.Clean(r.URL.Path)
+		if strings.HasSuffix(r.URL.Path, "/") && cleanPath != "/" {
+			cleanPath += "/"
+		}
+		if strings.Contains(r.URL.Path, "//") || cleanPath != r.URL.Path {
+			s.sendError(w, "not found", http.StatusNotFound)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // RegisterRoutes registers all plugin API routes on the provided mux.
-func (s *Server) RegisterRoutes(mux *http.ServeMux, uiPath string) {
-	mux.HandleFunc("/health", s.handleHealth)
-	mux.HandleFunc("/api/status", s.handleStatus)
-	mux.HandleFunc("/api/config", s.handleConfig)
-	mux.HandleFunc("/api/certificates", s.handleCertificates)
-	mux.HandleFunc("/api/certificates/", s.handleCertificateDetail)
-	mux.HandleFunc("/api/fallback/restart/acknowledge", s.handleFallbackRestartAcknowledge)
+func (s *Server) RegisterRoutes(mux *http.ServeMux, _ string) {
+	s.registerRoutes(mux, "")
 }
 
 // RegisterRoutesUnderPrefix registers the same routes under the UI proxy path.
 func (s *Server) RegisterRoutesUnderPrefix(mux *http.ServeMux, prefix string) {
-	mux.HandleFunc(prefix+"/health", s.handleHealth)
-	mux.HandleFunc(prefix+"/api/status", s.handleStatus)
-	mux.HandleFunc(prefix+"/api/config", s.handleConfig)
-	mux.HandleFunc(prefix+"/api/certificates", s.handleCertificates)
-	mux.HandleFunc(prefix+"/api/certificates/", s.handleCertificateDetail)
-	mux.HandleFunc(prefix+"/api/fallback/restart/acknowledge", s.handleFallbackRestartAcknowledge)
+	s.registerRoutes(mux, strings.TrimSuffix(prefix, "/"))
 }
 
-func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
+func (s *Server) registerRoutes(mux *http.ServeMux, prefix string) {
+	health := prefix + "/health"
+	api := prefix + "/api"
+	certificates := api + "/certificates"
+
+	mux.HandleFunc(health, s.allow([]string{http.MethodGet}, s.handleHealth))
+	mux.HandleFunc(health+"/", s.handleNotFound)
+	mux.HandleFunc(api+"/status", s.allow([]string{http.MethodGet}, s.handleStatus))
+	mux.HandleFunc(api+"/config", s.allow([]string{http.MethodGet, http.MethodPost}, s.handleConfig))
+	mux.HandleFunc(certificates, s.allow([]string{http.MethodGet, http.MethodPost}, s.handleCertificates))
+	mux.HandleFunc(certificates+"/", func(w http.ResponseWriter, r *http.Request) {
+		s.handleCertificatePath(w, r, certificates)
+	})
+	mux.HandleFunc(api+"/fallback/restart/acknowledge", s.allow([]string{http.MethodPost}, s.handleFallbackRestartAcknowledge))
+	mux.HandleFunc(api+"/", s.handleNotFound)
+}
+
+func (s *Server) allow(methods []string, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		for _, method := range methods {
+			if r.Method == method {
+				next(w, r)
+				return
+			}
+		}
+		w.Header().Set("Allow", strings.Join(methods, ", "))
+		s.sendError(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+func (s *Server) handleNotFound(w http.ResponseWriter, _ *http.Request) {
+	s.sendError(w, "not found", http.StatusNotFound)
+}
+
+func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	agg := s.aggregate()
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+	s.sendJSON(w, http.StatusOK, map[string]interface{}{
 		"status": agg.Status, "certificates": agg.Certificates,
 		"healthy": agg.Healthy, "errors": agg.Errors,
 	})
 }
 
-func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(s.aggregate())
+func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
+	s.sendJSON(w, http.StatusOK, s.aggregate())
 }
 
 func (s *Server) aggregate() status.AggregatedStatus {
@@ -90,128 +129,97 @@ func (s *Server) aggregate() status.AggregatedStatus {
 }
 
 func (s *Server) handleFallbackRestartAcknowledge(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
 	if err := s.manager.AcknowledgeFallbackRestart(r.Context()); err != nil {
-		s.sendError(w, err.Error(), http.StatusInternalServerError)
+		s.internalError(w, r, "acknowledge fallback restart", err)
 		return
 	}
 	sendOK(w)
 }
 
 func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case http.MethodGet:
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(s.manager.SnapshotConfig())
-	case http.MethodPost:
-		var candidate config.Config
-		if err := json.NewDecoder(r.Body).Decode(&candidate); err != nil {
-			s.sendError(w, "invalid JSON", http.StatusBadRequest)
-			return
-		}
-		if err := s.manager.ApplyConfig(r.Context(), &candidate); err != nil {
-			code := http.StatusInternalServerError
-			if isInvalidConfig(err) {
-				code = http.StatusBadRequest
-			}
-			s.sendError(w, err.Error(), code)
-			return
-		}
-		sendOK(w)
-	default:
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	if r.Method == http.MethodGet {
+		s.sendJSON(w, http.StatusOK, s.manager.SnapshotConfig())
+		return
 	}
+	var candidate config.Config
+	if !s.decodeJSON(w, r, &candidate) {
+		return
+	}
+	if err := s.manager.ApplyConfig(r.Context(), &candidate); err != nil {
+		s.managerError(w, r, "apply config", err)
+		return
+	}
+	sendOK(w)
 }
 
 func (s *Server) handleCertificates(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case http.MethodGet:
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(s.manager.SnapshotConfig().Certificates)
-	case http.MethodPost:
-		var certificate config.CertificateConfig
-		if err := json.NewDecoder(r.Body).Decode(&certificate); err != nil {
-			s.sendError(w, "invalid JSON", http.StatusBadRequest)
-			return
-		}
-		err := s.manager.MutateConfig(r.Context(), func(candidate *config.Config) error {
-			for _, existing := range candidate.Certificates {
-				if existing.Name == certificate.Name {
-					return errCertificateExists
-				}
-			}
-			candidate.Certificates = append(candidate.Certificates, certificate)
-			return nil
-		})
-		if err != nil {
-			code := http.StatusInternalServerError
-			if errors.Is(err, errCertificateExists) {
-				code = http.StatusConflict
-			} else if isInvalidConfig(err) {
-				code = http.StatusBadRequest
-			}
-			s.sendError(w, err.Error(), code)
-			return
-		}
-		sendOK(w)
-	default:
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	if r.Method == http.MethodGet {
+		s.sendJSON(w, http.StatusOK, s.manager.SnapshotConfig().Certificates)
+		return
 	}
+	var certificate config.CertificateConfig
+	if !s.decodeJSON(w, r, &certificate) {
+		return
+	}
+	err := s.manager.MutateConfig(r.Context(), func(candidate *config.Config) error {
+		for _, existing := range candidate.Certificates {
+			if existing.Name == certificate.Name {
+				return errCertificateExists
+			}
+		}
+		candidate.Certificates = append(candidate.Certificates, certificate)
+		return nil
+	})
+	if errors.Is(err, errCertificateExists) {
+		s.sendError(w, "configuration conflict", http.StatusConflict)
+		return
+	}
+	if err != nil {
+		s.managerError(w, r, "create certificate", err)
+		return
+	}
+	sendOK(w)
 }
 
-func (s *Server) handleCertificateDetail(w http.ResponseWriter, r *http.Request) {
-	path := r.URL.Path
-	prefix := "/api/certificates/"
-	if !strings.HasPrefix(path, prefix) {
-		prefix = "/ui/api/certificates/"
-		if !strings.HasPrefix(path, prefix) {
-			s.sendError(w, "invalid path: "+path, http.StatusBadRequest)
-			return
-		}
+func (s *Server) handleCertificatePath(w http.ResponseWriter, r *http.Request, collectionPath string) {
+	suffix := strings.TrimPrefix(r.URL.Path, collectionPath+"/")
+	parts := strings.Split(suffix, "/")
+	if len(parts) == 1 && parts[0] != "" {
+		s.allow([]string{http.MethodPut, http.MethodDelete}, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodPut {
+				s.updateCertificate(w, r, parts[0])
+			} else {
+				s.deleteCertificate(w, r, parts[0])
+			}
+		})(w, r)
+		return
 	}
-	parts := strings.SplitN(path[len(prefix):], "/", 2)
-	name, action := parts[0], ""
-	if len(parts) > 1 {
-		action = parts[1]
+	if len(parts) == 2 && parts[0] != "" && (parts[1] == "sync" || parts[1] == "validate") {
+		s.allow([]string{http.MethodPost}, func(w http.ResponseWriter, r *http.Request) {
+			var err error
+			if parts[1] == "sync" {
+				err = s.manager.SyncCertificate(parts[0])
+			} else {
+				err = s.manager.ValidateCertificate(parts[0])
+			}
+			if err != nil {
+				s.managerError(w, r, parts[1]+" certificate", err)
+				return
+			}
+			sendOK(w)
+		})(w, r)
+		return
 	}
-
-	switch r.Method {
-	case http.MethodPut:
-		s.updateCertificate(w, r, name)
-	case http.MethodDelete:
-		s.deleteCertificate(w, r, name)
-	case http.MethodPost:
-		var err error
-		switch action {
-		case "sync":
-			err = s.manager.SyncCertificate(name)
-		case "validate":
-			err = s.manager.ValidateCertificate(name)
-		default:
-			s.sendError(w, "unknown action", http.StatusBadRequest)
-			return
-		}
-		if err != nil {
-			s.sendError(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		sendOK(w)
-	default:
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-	}
+	s.handleNotFound(w, r)
 }
 
 func (s *Server) updateCertificate(w http.ResponseWriter, r *http.Request, name string) {
 	var updated config.CertificateConfig
-	if err := json.NewDecoder(r.Body).Decode(&updated); err != nil {
-		s.sendError(w, "invalid JSON", http.StatusBadRequest)
+	if !s.decodeJSON(w, r, &updated) {
 		return
 	}
 	if updated.Name != name {
-		s.sendError(w, "certificate name mismatch", http.StatusBadRequest)
+		s.sendError(w, "invalid request", http.StatusBadRequest)
 		return
 	}
 	err := s.manager.MutateConfig(r.Context(), func(candidate *config.Config) error {
@@ -223,14 +231,12 @@ func (s *Server) updateCertificate(w http.ResponseWriter, r *http.Request, name 
 		}
 		return errCertificateNotFound
 	})
+	if errors.Is(err, errCertificateNotFound) {
+		s.sendError(w, "certificate not found", http.StatusNotFound)
+		return
+	}
 	if err != nil {
-		code := http.StatusInternalServerError
-		if errors.Is(err, errCertificateNotFound) {
-			code = http.StatusNotFound
-		} else if isInvalidConfig(err) {
-			code = http.StatusBadRequest
-		}
-		s.sendError(w, err.Error(), code)
+		s.managerError(w, r, "update certificate", err)
 		return
 	}
 	sendOK(w)
@@ -246,28 +252,85 @@ func (s *Server) deleteCertificate(w http.ResponseWriter, r *http.Request, name 
 		}
 		return errCertificateNotFound
 	})
+	if errors.Is(err, errCertificateNotFound) {
+		s.sendError(w, "certificate not found", http.StatusNotFound)
+		return
+	}
 	if err != nil {
-		code := http.StatusInternalServerError
-		if errors.Is(err, errCertificateNotFound) {
-			code = http.StatusNotFound
-		}
-		s.sendError(w, err.Error(), code)
+		s.managerError(w, r, "delete certificate", err)
 		return
 	}
 	sendOK(w)
 }
 
-type invalidConfigError interface{ InvalidConfig() bool }
+func (s *Server) decodeJSON(w http.ResponseWriter, r *http.Request, destination interface{}) bool {
+	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || !strings.EqualFold(mediaType, "application/json") {
+		s.sendError(w, "content type must be application/json", http.StatusUnsupportedMediaType)
+		return false
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(destination); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			s.sendError(w, "request body too large", http.StatusRequestEntityTooLarge)
+		} else {
+			s.sendError(w, "invalid request body", http.StatusBadRequest)
+		}
+		return false
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			s.sendError(w, "request body too large", http.StatusRequestEntityTooLarge)
+		} else {
+			s.sendError(w, "invalid request body", http.StatusBadRequest)
+		}
+		return false
+	}
+	return true
+}
 
-func isInvalidConfig(err error) bool {
+type invalidConfigError interface{ InvalidConfig() bool }
+type configConflictError interface{ ConfigConflict() bool }
+type notFoundError interface{ NotFound() bool }
+type sourceValidationError interface{ SourceValidation() bool }
+
+func (s *Server) managerError(w http.ResponseWriter, r *http.Request, operation string, err error) {
+	s.logger.Error("API operation failed", "operation", operation, "method", r.Method, "path", r.URL.Path, "error", err)
 	var invalid invalidConfigError
-	return errors.As(err, &invalid) && invalid.InvalidConfig()
+	var conflict configConflictError
+	var missing notFoundError
+	var sourceInvalid sourceValidationError
+	switch {
+	case errors.As(err, &missing) && missing.NotFound():
+		s.sendError(w, "certificate not found", http.StatusNotFound)
+	case errors.As(err, &conflict) && conflict.ConfigConflict():
+		s.sendError(w, "configuration conflict", http.StatusConflict)
+	case errors.As(err, &sourceInvalid) && sourceInvalid.SourceValidation():
+		s.sendError(w, "certificate validation failed", http.StatusUnprocessableEntity)
+	case errors.As(err, &invalid) && invalid.InvalidConfig():
+		s.sendError(w, "invalid request", http.StatusBadRequest)
+	default:
+		s.sendError(w, "internal server error", http.StatusInternalServerError)
+	}
+}
+
+func (s *Server) internalError(w http.ResponseWriter, r *http.Request, operation string, err error) {
+	s.logger.Error("API operation failed", "operation", operation, "method", r.Method, "path", r.URL.Path, "error", err)
+	s.sendError(w, "internal server error", http.StatusInternalServerError)
 }
 
 func (s *Server) sendError(w http.ResponseWriter, message string, code int) {
+	s.sendJSON(w, code, map[string]string{"error": message})
+}
+
+func (s *Server) sendJSON(w http.ResponseWriter, code int, value interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
-	_ = json.NewEncoder(w).Encode(map[string]string{"error": message})
+	_ = json.NewEncoder(w).Encode(value)
 }
 
 func sendOK(w http.ResponseWriter) {

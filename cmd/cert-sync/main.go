@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -74,6 +75,25 @@ func (e configValidationError) Error() string       { return e.err.Error() }
 func (e configValidationError) Unwrap() error       { return e.err }
 func (e configValidationError) InvalidConfig() bool { return true }
 
+type configConflictError struct{ err error }
+
+func (e configConflictError) Error() string        { return e.err.Error() }
+func (e configConflictError) Unwrap() error        { return e.err }
+func (e configConflictError) ConfigConflict() bool { return true }
+
+type certificateNotFoundError struct{ name string }
+
+func (e certificateNotFoundError) Error() string {
+	return fmt.Sprintf("certificate %q not found", e.name)
+}
+func (e certificateNotFoundError) NotFound() bool { return true }
+
+type sourceValidationError struct{ err error }
+
+func (e sourceValidationError) Error() string          { return e.err.Error() }
+func (e sourceValidationError) Unwrap() error          { return e.err }
+func (e sourceValidationError) SourceValidation() bool { return true }
+
 func main() {
 	runtimeCfg, err := plugin.ServeAndRecvSpec(pluginSpec())
 	if err != nil {
@@ -118,7 +138,7 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
-	server := web.NewServer(m)
+	server := web.NewServer(m, logger)
 	server.RegisterRoutes(mux, uiPath)
 
 	embedWebRouter := plugin.NewPluginEmbedUIRouter(pluginID, &content, webRoot, uiPath)
@@ -135,9 +155,20 @@ func main() {
 
 	addr := "127.0.0.1:" + strconv.Itoa(runtimeCfg.Port)
 	logger.Info("starting plugin", "addr", addr)
-	if err := http.ListenAndServe(addr, mux); err != nil {
+	if err := newHTTPServer(addr, server.Handler(mux)).ListenAndServe(); err != nil {
 		logger.Error("http server error", "error", err)
 		os.Exit(1)
+	}
+}
+
+func newHTTPServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 }
 
@@ -245,6 +276,9 @@ func (m *manager) applyConfigLocked(ctx context.Context, candidate *config.Confi
 	}
 	staged.Normalize()
 	if err := staged.Validate(false, m.policy); err != nil {
+		if isConfigConflict(err) {
+			return configConflictError{err: err}
+		}
 		return configValidationError{err: err}
 	}
 	if err := m.loadRuntimeState(); err != nil {
@@ -332,6 +366,13 @@ func (m *manager) applyConfigLocked(ctx context.Context, candidate *config.Confi
 	return nil
 }
 
+func isConfigConflict(err error) bool {
+	message := err.Error()
+	return strings.Contains(message, "duplicate certificate name:") ||
+		strings.Contains(message, "duplicate destination:") ||
+		strings.Contains(message, "multiple fallback certificates for destination directory:")
+}
+
 func (m *manager) SyncCertificate(name string) error {
 	m.mu.RLock()
 	generation := m.generation
@@ -347,7 +388,7 @@ func (m *manager) syncGeneration(name string, generation uint64) error {
 	if !ok || activeGeneration != generation {
 		m.mu.RUnlock()
 		if !ok && activeGeneration == generation {
-			return fmt.Errorf("certificate not found")
+			return certificateNotFoundError{name: name}
 		}
 		return nil
 	}
@@ -371,6 +412,9 @@ func (m *manager) syncGeneration(name string, generation uint64) error {
 	}
 
 	info, result, syncErr := m.syncFunc(cfg, m.policy)
+	if syncErr != nil && info == nil && !isFilesystemError(syncErr) {
+		syncErr = sourceValidationError{err: syncErr}
+	}
 	var modified time.Time
 	if sourcePath, resolveErr := m.policy.ResolveSource(cfg.Source.Certificate, true); resolveErr == nil {
 		if fileInfo, statErr := os.Stat(sourcePath); statErr == nil {
@@ -656,7 +700,7 @@ func (m *manager) ValidateCertificate(name string) error {
 	generation := m.generation
 	if !ok {
 		m.mu.RUnlock()
-		return fmt.Errorf("certificate not found")
+		return certificateNotFoundError{name: name}
 	}
 	cfg := state.Config
 	m.mu.RUnlock()
@@ -668,12 +712,20 @@ func (m *manager) ValidateCertificate(name string) error {
 		if err == nil {
 			var info *certutil.CertInfo
 			info, err = m.validateFunc(certPath, keyPath)
+			if err != nil && !isFilesystemError(err) {
+				err = sourceValidationError{err: err}
+			}
 			m.recordValidation(name, generation, info, err)
 			return err
 		}
 	}
 	m.recordValidation(name, generation, nil, err)
 	return err
+}
+
+func isFilesystemError(err error) bool {
+	var pathErr *os.PathError
+	return errors.As(err, &pathErr)
 }
 
 func (m *manager) recordValidation(name string, generation uint64, info *certutil.CertInfo, validationErr error) {
