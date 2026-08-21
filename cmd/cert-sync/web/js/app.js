@@ -367,9 +367,17 @@ function openModal(cert) {
     document.getElementById('btn-sync-now').style.display = cert ? 'inline-block' : 'none';
     document.getElementById('modal-message').classList.add('hidden');
     setModalBusy(false);
+    resetDeleteConfirmation();
     updateSourceFields(false);
     document.getElementById('modal').classList.remove('hidden');
     requestAnimationFrame(() => nameInput.focus());
+}
+
+function resetDeleteConfirmation() {
+    clearTimeout(deleteConfirmTimer);
+    const button = document.getElementById('btn-delete');
+    button.dataset.confirming = '';
+    button.textContent = 'Delete';
 }
 
 function closeModal() {
@@ -377,6 +385,7 @@ function closeModal() {
     document.getElementById('modal').classList.add('hidden');
     currentCertName = null;
     remoteCredentialsConfigured = false;
+    resetDeleteConfirmation();
     if (modalReturnFocus && document.contains(modalReturnFocus)) modalReturnFocus.focus();
     modalReturnFocus = null;
 }
@@ -427,9 +436,13 @@ function showModalMessage(text, isError) {
     message.className = `message ${isError ? 'error-message' : 'warning-message'}`;
 }
 
-async function saveCert(event) {
-    event.preventDefault();
+async function saveCert() {
     if (modalOperationInFlight) return;
+    const form = document.getElementById('cert-form');
+    if (!form.checkValidity()) {
+        form.reportValidity();
+        return;
+    }
     const originalName = currentCertName;
     const cert = getFormCert();
     setModalBusy(true);
@@ -448,10 +461,26 @@ async function saveCert(event) {
     }
 }
 
+let deleteConfirmTimer = null;
+
 async function deleteCert() {
     if (!currentCertName || modalOperationInFlight) return;
     const name = currentCertName;
-    if (!confirm(`Delete certificate "${name}"?`)) return;
+    const button = document.getElementById('btn-delete');
+    if (button.dataset.confirming !== 'true') {
+        button.dataset.confirming = 'true';
+        const originalText = button.textContent;
+        button.textContent = 'Confirm Delete';
+        clearTimeout(deleteConfirmTimer);
+        deleteConfirmTimer = setTimeout(() => {
+            button.dataset.confirming = '';
+            button.textContent = originalText;
+        }, 3000);
+        return;
+    }
+    clearTimeout(deleteConfirmTimer);
+    button.dataset.confirming = '';
+    button.textContent = 'Delete';
     setModalBusy(true);
     try {
         await fetchJSON(`${API.certificates}/${encodeURIComponent(name)}`, { method: 'DELETE' });
@@ -561,7 +590,8 @@ document.querySelector('.close').addEventListener('click', closeModal);
 document.getElementById('cert-source-type').addEventListener('change', () => updateSourceFields(true));
 document.getElementById('cert-warden-certificate-api-key').addEventListener('input', updateCredentialRequirements);
 document.getElementById('cert-warden-private-key-api-key').addEventListener('input', updateCredentialRequirements);
-document.getElementById('cert-form').addEventListener('submit', saveCert);
+document.getElementById('cert-form').addEventListener('submit', event => { event.preventDefault(); saveCert(); });
+document.getElementById('btn-save').addEventListener('click', saveCert);
 document.getElementById('btn-delete').addEventListener('click', deleteCert);
 document.getElementById('btn-sync-now').addEventListener('click', syncCurrentCert);
 document.getElementById('btn-validate').addEventListener('click', validateCert);
