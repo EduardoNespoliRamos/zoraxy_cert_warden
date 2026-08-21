@@ -19,31 +19,21 @@ local PEM files produced by the client and makes them available to Zoraxy.
 ## Architecture
 
 ```
-Cloudflare
-    ↓
-Let's Encrypt
-    ↓
-Cert Warden
-    ↓
 Cert Warden Client
-    ↓
-/cert_warden_plugin/certchain0.pem
-/cert_warden_plugin/key0.pem
-    ↓
-Zoraxy Cert Warden Sync plugin
-    ↓
-/opt/zoraxy/config/conf/certs/homealone-wildcard.pem
-/opt/zoraxy/config/conf/certs/homealone-wildcard.key
-    ↓
-Zoraxy TLS
+    -> /cert_warden_plugin/certchain0.pem + key0.pem
+    -> Zoraxy Cert Warden Sync plugin
+    -> /opt/zoraxy/config/conf/certs/example-certificate.pem + .key
+    -> Zoraxy TLS
 ```
 
 ## Features
 
 - Detects certificate files written by Cert Warden Client.
-- Validates certificate + private key correspondence and validity.
-- Atomic writes (`.tmp` + `rename`) to avoid half-written certificates.
-- SHA-256 fingerprint comparison to skip unnecessary writes.
+- Validates the presented certificate chain, validity period, server usage, and
+  private key correspondence.
+- Transactionally replaces certificate/key pairs using staging files, backups,
+  post-install validation, and rollback.
+- Compares a SHA-256 bundle digest to skip unnecessary writes.
 - `fsnotify` watcher with polling fallback.
 - Debounce to handle certificate/key updates as a single event.
 - Web UI inside Zoraxy for configuration and status.
@@ -53,18 +43,23 @@ Zoraxy TLS
 
 ## Known limitations
 
-Zoraxy does not expose an official plugin API to reload certificates or to set
-the fallback certificate at runtime. Therefore:
+The plugin writes Zoraxy's certificate-store files directly; it does not call a
+Zoraxy certificate reload API. For a certificate selected through
+`fallback.json`, Zoraxy only reads that selection at startup. Therefore:
 
-- For host-specific certificates, Zoraxy's legacy filename matching picks up
-  the new files immediately.
-- For wildcard certificates used as fallback, the plugin writes
+- For certificates used as fallback, the plugin writes
   `fallback.json`, but Zoraxy only reads it on startup. **You must restart
-  Zoraxy to activate a fallback certificate.** The UI clearly warns about this.
+  Zoraxy to activate a fallback certificate.** The pending warning persists
+  until the operator acknowledges it after the restart; acknowledgement itself
+  does not restart or reload Zoraxy.
+- Encrypted private keys are not supported. Cert Warden Client must provide an
+  unencrypted RSA, EC, or PKCS#8 private key.
 
 ## Requirements
 
-- Zoraxy v3.2.0 or newer.
+- Zoraxy v3.3.0 through v3.3.3. These are the supported release versions;
+  prereleases and newer releases are not part of the support policy until added
+  to the compatibility baseline.
 - Linux amd64 or arm64.
 - Docker or Podman for the containerized build/test workflow.
 
@@ -129,15 +124,15 @@ services:
       - CERT_SYNC_ALLOWED_SOURCE_ROOTS=/cert_warden_plugin
       - CERT_SYNC_ALLOWED_DESTINATION_ROOTS=/opt/zoraxy/config/conf/certs
     volumes:
-      - /mnt/raid/docker-compose/zoraxy/config:/opt/zoraxy/config
-      - /mnt/raid/docker-compose/zoraxy/plugin:/opt/zoraxy/plugin
-      - /mnt/raid/docker-compose/zoraxy/certs:/cert_warden_plugin:ro
+      - /path/to/zoraxy/config:/opt/zoraxy/config
+      - /path/to/zoraxy/plugin:/opt/zoraxy/plugin
+      - /path/to/cert-warden/output:/cert_warden_plugin:ro
 ```
 
 Place the plugin binary under the mounted plugin volume:
 
 ```
-/mnt/raid/docker-compose/zoraxy/plugin/
+/path/to/zoraxy/plugin/
 └── com.eduardoramos.zoraxy.certwarden/
     ├── com.eduardoramos.zoraxy.certwarden
     ├── config.json
@@ -152,7 +147,7 @@ Cert Warden Client output:
 - Source certificate: `/cert_warden_plugin/certchain0.pem`
 - Source private key: `/cert_warden_plugin/key0.pem`
 - Target directory: `/opt/zoraxy/config/conf/certs`
-- Target name: `homealone-wildcard`
+- Target name: `example-certificate`
 
 Configuration is persisted in `config.json` inside the plugin directory.
 
@@ -177,31 +172,73 @@ Paths must be absolute and normalized, and may contain letters, numbers, `/`,
 `.`, `_`, and `-`. Symlinks are resolved before access and cannot escape the
 configured roots.
 
+### Synchronization modes
+
+- **Manual:** disable Auto Sync. Validate and Sync Now remain available in the
+  UI, but no watcher runs for that entry.
+- **Polling:** enable Auto Sync and disable Filesystem Watch. The polling
+  interval detects source changes.
+- **Filesystem events with polling fallback:** enable both Auto Sync and
+  Filesystem Watch. `fsnotify` handles prompt updates and polling still detects
+  missed events. Changes are debounced so separately written certificate and
+  key files can settle before validation.
+
+Validation reads and checks the source pair but does not install it. Sync Now
+validates the source, validates the existing destination when present, compares
+their bundle digests, and replaces the destination only when required.
+
+### Identity and replacement
+
+The UI's certificate fingerprint is the SHA-256 fingerprint of the leaf
+certificate's DER bytes. Synchronization equality instead uses a SHA-256 bundle
+digest over every certificate in presented order plus the private key's public
+key. A changed intermediate chain therefore triggers synchronization even when
+the leaf fingerprint is unchanged.
+
+Each destination file is staged and durably written before publication. The
+old certificate and key are retained as backups while the new files are renamed
+into place, then the installed pair is validated and the directory is synced.
+Failures trigger rollback and report rollback state. The operation is
+transactional with rollback, but it is **not an atomic two-file filesystem
+replacement**: observers can briefly see one new file and one old file between
+the two renames.
+
 ## UI
 
 The plugin UI is available at:
 
 ```
-https://<zoraxy>/plugin.ui/com.eduardoramos.zoraxy.certwarden/ui/
+https://<zoraxy>/plugin.ui/com.eduardoramos.zoraxy.certwarden/
 ```
+
+Zoraxy proxies that inbound path to the plugin's declared `/ui/*` path. The UI
+API is consequently registered under `/ui/api/*` in addition to direct plugin
+routes. `PermittedAPIEndpoints` has a different purpose: it allowlists outbound
+requests from a plugin to Zoraxy APIs. This plugin makes no such calls and
+declares no permitted outbound endpoints. Mutating UI requests carry Zoraxy's
+CSRF token.
 
 It shows:
 
-- Overall status (Healthy/Error/Unknown).
+- Overall status (Healthy/Error/Unknown) and per-entry Disabled status.
 - One card per configured certificate with domain, issuer, expiry, last sync,
   fingerprints, and key match status.
 - Buttons to edit, validate, sync now, and add/remove certificates.
 
+Source validation, destination validation, synchronization, and watcher errors
+are tracked independently. An enabled entry is Healthy only when its source and
+destination have validated matching bundle digests. Disabled entries remain
+visible, count as Disabled, and do not degrade aggregate health.
+
 ## Logs
 
-The plugin writes structured logs to stdout. Examples:
+The plugin writes structured logs to stdout. It logs startup, shutdown,
+watcher degradation, sync failures, and API failures. For example:
 
 ```
-INFO cert-sync certificate=homealone-wildcard source_changed=true
-INFO cert-sync certificate=homealone-wildcard validation=success
-INFO cert-sync certificate=homealone-wildcard sync=success fingerprint=abc...
-INFO cert-sync certificate=homealone-wildcard no_changes=true
-ERROR cert-sync certificate=homealone-wildcard validation="certificate and private key do not match"
+INFO starting plugin addr=127.0.0.1:19090
+WARN "fsnotify unavailable; using polling only" error="..."
+ERROR "cert-sync failed" certificate=example-certificate error="certificate and private key do not match: ..."
 ```
 
 Private keys are never logged.
@@ -214,7 +251,7 @@ Run unit tests:
 make test
 ```
 
-Run integration tests with Zoraxy v3.3.3:
+Run filesystem integration tests for sync and watcher behavior:
 
 ```bash
 make integration-test
@@ -226,10 +263,10 @@ Run E2E tests with Playwright:
 make e2e-test
 ```
 
-Test against a different Zoraxy version:
+Run the E2E suite against a different Zoraxy version:
 
 ```bash
-ZORAXY_VERSION=v3.3.2 make integration-test
+ZORAXY_VERSION=v3.3.2 make e2e-test
 ```
 
 Generate local test certificates:
@@ -282,26 +319,26 @@ hotfix flows are preferred.
 
 This repository uses GitHub Actions. See `.github/workflows/`.
 
-- **CI** (`ci.yml`) — runs unit tests, E2E tests against Zoraxy `v3.3.3`, and
-  builds `linux/amd64` and `linux/arm64` binaries on every PR and push to
-  `main` and `develop`.
-- **Compatibility** (`compatibility.yml`) — runs integration tests against the
-  full Zoraxy version matrix on every PR and push to `main` and `develop`.
-- **Release** (`release.yml`) — triggered by tags `v*.*.*`, creates a GitHub
-  Release with the compiled binaries and `SHA256SUMS`.
+- **CI** (`ci.yml`) — runs formatting, unit, race, vet, static analysis,
+  repeated watcher/sync, filesystem integration, and cross-architecture build
+  gates on every PR and push to `main` and `develop`.
+- **Compatibility** (`compatibility.yml`) — runs Playwright through Zoraxy for
+  every stable version below, with nonblocking prerelease/latest canaries.
+- **Release** (`release.yml`) — reruns all quality and stable E2E gates, builds
+  versioned `linux/amd64` and `linux/arm64` binaries, and publishes them with
+  `SHA256SUMS`.
 
 ### Testing matrix
 
-Integration tests run against:
+The supported release matrix is:
 
 - `v3.3.0`
 - `v3.3.1`
 - `v3.3.2`
 - `v3.3.3`
-- `v3.3.4-rc1`
-- `v3.3.4-rc2`
-- `v3.3.4-rc3`
-- `latest`
+
+CI may probe prerelease or latest images for early compatibility feedback, but
+passing those jobs does not make those versions supported releases.
 
 ## Troubleshooting
 
@@ -319,7 +356,9 @@ manual sync after both files are updated.
 ### Fallback certificate not active
 
 The plugin writes `fallback.json` but Zoraxy only reads it on startup. Restart
-Zoraxy after enabling fallback.
+Zoraxy after changing fallback configuration, then acknowledge the persistent
+warning in the UI. Acknowledging before restart only clears the warning; it does
+not apply the fallback configuration.
 
 ### Target directory not writable
 

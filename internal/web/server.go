@@ -1,310 +1,343 @@
 package web
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"io"
+	"log/slog"
+	"mime"
 	"net/http"
+	"path"
 	"strings"
-	"sync"
 
 	"github.com/eduardoramos/zoraxy-cert-warden/internal/config"
 	"github.com/eduardoramos/zoraxy-cert-warden/internal/status"
 )
 
-// Syncer is the interface implemented by the main sync runner.
-type Syncer interface {
-	SyncCertificate(name string) error
-	ValidateCertificate(name string) error
-	ReloadConfig(cfg *config.Config) error
+const maxRequestBodyBytes int64 = 64 << 10
+
+var (
+	errCertificateExists   = errors.New("certificate already exists")
+	errCertificateNotFound = errors.New("certificate not found")
+)
+
+// ConfigMutation changes a manager-owned candidate while config application is
+// serialized. The candidate is discarded if the mutation or apply fails.
+type ConfigMutation func(*config.Config) error
+
+// Manager is the sole owner of configuration and runtime state used by HTTP.
+type Manager interface {
+	SnapshotConfig() *config.Config
+	SnapshotStatus() []status.CertificateStatus
+	ApplyConfig(context.Context, *config.Config) error
+	MutateConfig(context.Context, ConfigMutation) error
+	SyncCertificate(string) error
+	ValidateCertificate(string) error
+	FallbackRestartPending() bool
+	AcknowledgeFallbackRestart(context.Context) error
 }
 
 // Server provides HTTP handlers for the plugin UI and API.
 type Server struct {
-	mu         sync.RWMutex
-	cfg        *config.Config
-	states     map[string]*status.State
-	syncer     Syncer
-	configPath string
-	policy     *config.PathPolicy
+	manager Manager
+	logger  *slog.Logger
 }
 
-// NewServer creates a new web server.
-func NewServer(cfg *config.Config, states map[string]*status.State, syncer Syncer, configPath string, policy *config.PathPolicy) *Server {
-	return &Server{
-		cfg:        cfg,
-		states:     states,
-		syncer:     syncer,
-		configPath: configPath,
-		policy:     policy,
+// NewServer creates a server backed only by manager service operations.
+func NewServer(manager Manager, logger ...*slog.Logger) *Server {
+	log := slog.Default()
+	if len(logger) > 0 && logger[0] != nil {
+		log = logger[0]
 	}
+	return &Server{manager: manager, logger: log}
 }
 
-// RegisterRoutes registers all plugin API routes on the provided mux.
-func (s *Server) RegisterRoutes(mux *http.ServeMux, uiPath string) {
-	mux.HandleFunc("/health", s.handleHealth)
-	mux.HandleFunc("/api/status", s.handleStatus)
-	mux.HandleFunc("/api/config", s.handleConfig)
-	mux.HandleFunc("/api/certificates", s.handleCertificates)
-	mux.HandleFunc("/api/certificates/", s.handleCertificateDetail)
-}
-
-// RegisterRoutesUnderPrefix registers the same routes under a prefix (e.g. the
-// UI path) so Zoraxy can proxy them together with the static files.
-func (s *Server) RegisterRoutesUnderPrefix(mux *http.ServeMux, prefix string) {
-	mux.HandleFunc(prefix+"/health", s.handleHealth)
-	mux.HandleFunc(prefix+"/api/status", s.handleStatus)
-	mux.HandleFunc(prefix+"/api/config", s.handleConfig)
-	mux.HandleFunc(prefix+"/api/certificates", s.handleCertificates)
-	mux.HandleFunc(prefix+"/api/certificates/", s.handleCertificateDetail)
-}
-
-func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	agg := s.aggregate()
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"status":       agg.Status,
-		"certificates": agg.Certificates,
-		"healthy":      agg.Healthy,
-		"errors":       agg.Errors,
+// Handler rejects paths ServeMux would otherwise normalize and redirect.
+func (s *Server) Handler(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cleanPath := path.Clean(r.URL.Path)
+		if strings.HasSuffix(r.URL.Path, "/") && cleanPath != "/" {
+			cleanPath += "/"
+		}
+		if strings.Contains(r.URL.Path, "//") || cleanPath != r.URL.Path {
+			s.sendError(w, "not found", http.StatusNotFound)
+			return
+		}
+		next.ServeHTTP(w, r)
 	})
 }
 
-func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
+// RegisterRoutes registers all plugin API routes on the provided mux.
+func (s *Server) RegisterRoutes(mux *http.ServeMux, _ string) {
+	s.registerRoutes(mux, "")
+}
+
+// RegisterRoutesUnderPrefix registers the same routes under the UI proxy path.
+func (s *Server) RegisterRoutesUnderPrefix(mux *http.ServeMux, prefix string) {
+	s.registerRoutes(mux, strings.TrimSuffix(prefix, "/"))
+}
+
+func (s *Server) registerRoutes(mux *http.ServeMux, prefix string) {
+	health := prefix + "/health"
+	api := prefix + "/api"
+	certificates := api + "/certificates"
+
+	mux.HandleFunc(health, s.allow([]string{http.MethodGet}, s.handleHealth))
+	mux.HandleFunc(health+"/", s.handleNotFound)
+	mux.HandleFunc(api+"/status", s.allow([]string{http.MethodGet}, s.handleStatus))
+	mux.HandleFunc(api+"/config", s.allow([]string{http.MethodGet, http.MethodPost}, s.handleConfig))
+	mux.HandleFunc(certificates, s.allow([]string{http.MethodGet, http.MethodPost}, s.handleCertificates))
+	mux.HandleFunc(certificates+"/", func(w http.ResponseWriter, r *http.Request) {
+		s.handleCertificatePath(w, r, certificates)
+	})
+	mux.HandleFunc(api+"/fallback/restart/acknowledge", s.allow([]string{http.MethodPost}, s.handleFallbackRestartAcknowledge))
+	mux.HandleFunc(api+"/", s.handleNotFound)
+}
+
+func (s *Server) allow(methods []string, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		for _, method := range methods {
+			if r.Method == method {
+				next(w, r)
+				return
+			}
+		}
+		w.Header().Set("Allow", strings.Join(methods, ", "))
+		s.sendError(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+func (s *Server) handleNotFound(w http.ResponseWriter, _ *http.Request) {
+	s.sendError(w, "not found", http.StatusNotFound)
+}
+
+func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	agg := s.aggregate()
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(agg)
+	s.sendJSON(w, http.StatusOK, map[string]interface{}{
+		"status": agg.Status, "certificates": agg.Certificates,
+		"healthy": agg.Healthy, "errors": agg.Errors,
+	})
+}
+
+func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
+	s.sendJSON(w, http.StatusOK, s.aggregate())
 }
 
 func (s *Server) aggregate() status.AggregatedStatus {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	return status.Aggregate(s.manager.SnapshotStatus(), s.manager.FallbackRestartPending())
+}
 
-	items := make([]status.CertificateStatus, 0, len(s.states))
-	for _, st := range s.states {
-		items = append(items, st.ToCertificateStatus())
+func (s *Server) handleFallbackRestartAcknowledge(w http.ResponseWriter, r *http.Request) {
+	if err := s.manager.AcknowledgeFallbackRestart(r.Context()); err != nil {
+		s.internalError(w, r, "acknowledge fallback restart", err)
+		return
 	}
-	return status.Aggregate(items)
+	sendOK(w)
 }
 
 func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case http.MethodGet:
-		s.mu.RLock()
-		cfg := *s.cfg
-		s.mu.RUnlock()
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(cfg)
-	case http.MethodPost:
-		var newCfg config.Config
-		if err := json.NewDecoder(r.Body).Decode(&newCfg); err != nil {
-			s.sendError(w, "invalid JSON", http.StatusBadRequest)
-			return
-		}
-		if err := newCfg.Validate(false, s.policy); err != nil {
-			s.sendError(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		if err := newCfg.Save(s.configPath, s.policy); err != nil {
-			s.sendError(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		if err := s.syncer.ReloadConfig(&newCfg); err != nil {
-			s.sendError(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		s.mu.Lock()
-		s.cfg = &newCfg
-		s.mu.Unlock()
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-	default:
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	if r.Method == http.MethodGet {
+		s.sendJSON(w, http.StatusOK, s.manager.SnapshotConfig())
+		return
 	}
+	var candidate config.Config
+	if !s.decodeJSON(w, r, &candidate) {
+		return
+	}
+	if err := s.manager.ApplyConfig(r.Context(), &candidate); err != nil {
+		s.managerError(w, r, "apply config", err)
+		return
+	}
+	sendOK(w)
 }
 
 func (s *Server) handleCertificates(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case http.MethodGet:
-		s.mu.RLock()
-		defer s.mu.RUnlock()
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(s.cfg.Certificates)
-	case http.MethodPost:
-		var newCert config.CertificateConfig
-		if err := json.NewDecoder(r.Body).Decode(&newCert); err != nil {
-			s.sendError(w, "invalid JSON", http.StatusBadRequest)
-			return
-		}
-		if err := newCert.Validate(false, s.policy); err != nil {
-			s.sendError(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		s.mu.Lock()
-		for _, c := range s.cfg.Certificates {
-			if c.Name == newCert.Name {
-				s.mu.Unlock()
-				s.sendError(w, "certificate already exists", http.StatusConflict)
-				return
+	if r.Method == http.MethodGet {
+		s.sendJSON(w, http.StatusOK, s.manager.SnapshotConfig().Certificates)
+		return
+	}
+	var certificate config.CertificateConfig
+	if !s.decodeJSON(w, r, &certificate) {
+		return
+	}
+	err := s.manager.MutateConfig(r.Context(), func(candidate *config.Config) error {
+		for _, existing := range candidate.Certificates {
+			if existing.Name == certificate.Name {
+				return errCertificateExists
 			}
 		}
-		s.cfg.Certificates = append(s.cfg.Certificates, newCert)
-		if err := s.cfg.Save(s.configPath, s.policy); err != nil {
-			s.mu.Unlock()
-			s.sendError(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		s.mu.Unlock()
-		if err := s.syncer.ReloadConfig(s.cfg); err != nil {
-			s.sendError(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-	default:
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		candidate.Certificates = append(candidate.Certificates, certificate)
+		return nil
+	})
+	if errors.Is(err, errCertificateExists) {
+		s.sendError(w, "configuration conflict", http.StatusConflict)
+		return
 	}
+	if err != nil {
+		s.managerError(w, r, "create certificate", err)
+		return
+	}
+	sendOK(w)
 }
 
-func (s *Server) handleCertificateDetail(w http.ResponseWriter, r *http.Request) {
-	path := r.URL.Path
-	prefix := "/api/certificates/"
-	if !strings.HasPrefix(path, prefix) {
-		// Also accept paths under the UI prefix when proxied by Zoraxy
-		altPrefix := "/ui/api/certificates/"
-		if strings.HasPrefix(path, altPrefix) {
-			prefix = altPrefix
-		} else {
-			s.sendError(w, "invalid path: "+path, http.StatusBadRequest)
-			return
-		}
+func (s *Server) handleCertificatePath(w http.ResponseWriter, r *http.Request, collectionPath string) {
+	suffix := strings.TrimPrefix(r.URL.Path, collectionPath+"/")
+	parts := strings.Split(suffix, "/")
+	if len(parts) == 1 && parts[0] != "" {
+		s.allow([]string{http.MethodPut, http.MethodDelete}, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodPut {
+				s.updateCertificate(w, r, parts[0])
+			} else {
+				s.deleteCertificate(w, r, parts[0])
+			}
+		})(w, r)
+		return
 	}
-	rest := path[len(prefix):]
-	parts := strings.SplitN(rest, "/", 2)
-	name := parts[0]
-	action := ""
-	if len(parts) > 1 {
-		action = parts[1]
-	}
-
-	switch r.Method {
-	case http.MethodPut:
-		s.updateCertificate(w, r, name)
-	case http.MethodDelete:
-		s.deleteCertificate(w, r, name)
-	case http.MethodPost:
-		switch action {
-		case "sync":
-			if err := s.syncer.SyncCertificate(name); err != nil {
-				s.sendError(w, err.Error(), http.StatusInternalServerError)
+	if len(parts) == 2 && parts[0] != "" && (parts[1] == "sync" || parts[1] == "validate") {
+		s.allow([]string{http.MethodPost}, func(w http.ResponseWriter, r *http.Request) {
+			var err error
+			if parts[1] == "sync" {
+				err = s.manager.SyncCertificate(parts[0])
+			} else {
+				err = s.manager.ValidateCertificate(parts[0])
+			}
+			if err != nil {
+				s.managerError(w, r, parts[1]+" certificate", err)
 				return
 			}
-			s.sendOK(w)
-		case "validate":
-			if err := s.syncer.ValidateCertificate(name); err != nil {
-				s.sendError(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-			s.sendOK(w)
-		default:
-			s.sendError(w, "unknown action", http.StatusBadRequest)
-		}
-	default:
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			sendOK(w)
+		})(w, r)
+		return
 	}
+	s.handleNotFound(w, r)
 }
 
 func (s *Server) updateCertificate(w http.ResponseWriter, r *http.Request, name string) {
 	var updated config.CertificateConfig
-	if err := json.NewDecoder(r.Body).Decode(&updated); err != nil {
-		s.sendError(w, "invalid JSON", http.StatusBadRequest)
+	if !s.decodeJSON(w, r, &updated) {
 		return
 	}
 	if updated.Name != name {
-		s.sendError(w, "certificate name mismatch", http.StatusBadRequest)
+		s.sendError(w, "invalid request", http.StatusBadRequest)
 		return
 	}
-	if err := updated.Validate(false, s.policy); err != nil {
-		s.sendError(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	s.mu.Lock()
-	found := false
-	for i := range s.cfg.Certificates {
-		if s.cfg.Certificates[i].Name == name {
-			s.cfg.Certificates[i] = updated
-			found = true
-			break
+	err := s.manager.MutateConfig(r.Context(), func(candidate *config.Config) error {
+		for i := range candidate.Certificates {
+			if candidate.Certificates[i].Name == name {
+				candidate.Certificates[i] = updated
+				return nil
+			}
 		}
-	}
-	if !found {
-		s.mu.Unlock()
+		return errCertificateNotFound
+	})
+	if errors.Is(err, errCertificateNotFound) {
 		s.sendError(w, "certificate not found", http.StatusNotFound)
 		return
 	}
-	if err := s.cfg.Save(s.configPath, s.policy); err != nil {
-		s.mu.Unlock()
-		s.sendError(w, err.Error(), http.StatusInternalServerError)
+	if err != nil {
+		s.managerError(w, r, "update certificate", err)
 		return
 	}
-	s.mu.Unlock()
-	if err := s.syncer.ReloadConfig(s.cfg); err != nil {
-		s.sendError(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	s.sendOK(w)
+	sendOK(w)
 }
 
 func (s *Server) deleteCertificate(w http.ResponseWriter, r *http.Request, name string) {
-	s.mu.Lock()
-	found := false
-	newCerts := make([]config.CertificateConfig, 0, len(s.cfg.Certificates))
-	for _, c := range s.cfg.Certificates {
-		if c.Name == name {
-			found = true
-			continue
+	err := s.manager.MutateConfig(r.Context(), func(candidate *config.Config) error {
+		for i := range candidate.Certificates {
+			if candidate.Certificates[i].Name == name {
+				candidate.Certificates = append(candidate.Certificates[:i], candidate.Certificates[i+1:]...)
+				return nil
+			}
 		}
-		newCerts = append(newCerts, c)
-	}
-	if !found {
-		s.mu.Unlock()
+		return errCertificateNotFound
+	})
+	if errors.Is(err, errCertificateNotFound) {
 		s.sendError(w, "certificate not found", http.StatusNotFound)
 		return
 	}
-	s.cfg.Certificates = newCerts
-	if err := s.cfg.Save(s.configPath, s.policy); err != nil {
-		s.mu.Unlock()
-		s.sendError(w, err.Error(), http.StatusInternalServerError)
+	if err != nil {
+		s.managerError(w, r, "delete certificate", err)
 		return
 	}
-	s.mu.Unlock()
-	if err := s.syncer.ReloadConfig(s.cfg); err != nil {
-		s.sendError(w, err.Error(), http.StatusInternalServerError)
-		return
+	sendOK(w)
+}
+
+func (s *Server) decodeJSON(w http.ResponseWriter, r *http.Request, destination interface{}) bool {
+	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || !strings.EqualFold(mediaType, "application/json") {
+		s.sendError(w, "content type must be application/json", http.StatusUnsupportedMediaType)
+		return false
 	}
-	s.sendOK(w)
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(destination); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			s.sendError(w, "request body too large", http.StatusRequestEntityTooLarge)
+		} else {
+			s.sendError(w, "invalid request body", http.StatusBadRequest)
+		}
+		return false
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			s.sendError(w, "request body too large", http.StatusRequestEntityTooLarge)
+		} else {
+			s.sendError(w, "invalid request body", http.StatusBadRequest)
+		}
+		return false
+	}
+	return true
+}
+
+type invalidConfigError interface{ InvalidConfig() bool }
+type configConflictError interface{ ConfigConflict() bool }
+type notFoundError interface{ NotFound() bool }
+type sourceValidationError interface{ SourceValidation() bool }
+
+func (s *Server) managerError(w http.ResponseWriter, r *http.Request, operation string, err error) {
+	s.logger.Error("API operation failed", "operation", operation, "method", r.Method, "path", r.URL.Path, "error", err)
+	var invalid invalidConfigError
+	var conflict configConflictError
+	var missing notFoundError
+	var sourceInvalid sourceValidationError
+	switch {
+	case errors.As(err, &missing) && missing.NotFound():
+		s.sendError(w, "certificate not found", http.StatusNotFound)
+	case errors.As(err, &conflict) && conflict.ConfigConflict():
+		s.sendError(w, "configuration conflict", http.StatusConflict)
+	case errors.As(err, &sourceInvalid) && sourceInvalid.SourceValidation():
+		s.sendError(w, "certificate validation failed", http.StatusUnprocessableEntity)
+	case errors.As(err, &invalid) && invalid.InvalidConfig():
+		s.sendError(w, "invalid request", http.StatusBadRequest)
+	default:
+		s.sendError(w, "internal server error", http.StatusInternalServerError)
+	}
+}
+
+func (s *Server) internalError(w http.ResponseWriter, r *http.Request, operation string, err error) {
+	s.logger.Error("API operation failed", "operation", operation, "method", r.Method, "path", r.URL.Path, "error", err)
+	s.sendError(w, "internal server error", http.StatusInternalServerError)
 }
 
 func (s *Server) sendError(w http.ResponseWriter, message string, code int) {
+	s.sendJSON(w, code, map[string]string{"error": message})
+}
+
+func (s *Server) sendJSON(w http.ResponseWriter, code int, value interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
-	json.NewEncoder(w).Encode(map[string]string{"error": message})
+	_ = json.NewEncoder(w).Encode(value)
 }
 
-func (s *Server) sendOK(w http.ResponseWriter) {
+func sendOK(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
-// MaskedConfig returns a copy of the config with private key paths only.
-func MaskedConfig(cfg *config.Config) *config.Config {
-	return cfg
-}
+// MaskedConfig returns the supplied snapshot. Paths are operational metadata,
+// not private key contents.
+func MaskedConfig(cfg *config.Config) *config.Config { return cfg }

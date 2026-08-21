@@ -1,0 +1,59 @@
+name: E2E Compatibility Gates
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Git ref to test
+        required: false
+        type: string
+      run_canaries:
+        description: Run nonblocking prerelease and latest checks
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  stable:
+    name: E2E Zoraxy ${{ matrix.zoraxy_version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        zoraxy_version: [v3.3.0, v3.3.1, v3.3.2, v3.3.3]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - name: Run Playwright through Zoraxy
+        run: DOCKER=docker ZORAXY_VERSION=${{ matrix.zoraxy_version }} make e2e-test
+
+  stable-aggregate:
+    name: E2E stable
+    if: always()
+    runs-on: ubuntu-latest
+    needs: stable
+    steps:
+      - name: Require the stable matrix
+        env:
+          RESULT: ${{ needs.stable.result }}
+        run: test "$RESULT" = "success"
+
+  canary:
+    name: E2E canary Zoraxy ${{ matrix.zoraxy_version }}
+    if: inputs.run_canaries
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        zoraxy_version: [v3.3.4-rc1, v3.3.4-rc2, v3.3.4-rc3, latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - name: Run nonblocking Playwright canary
+        run: DOCKER=docker ZORAXY_VERSION=${{ matrix.zoraxy_version }} make e2e-test

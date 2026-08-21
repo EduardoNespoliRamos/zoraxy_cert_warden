@@ -9,12 +9,8 @@ else
   BRANCHES=("$@")
 fi
 
-# Note: the integration-matrix job from compatibility.yml is intentionally
-# NOT listed as a required status check. Because it uses a build matrix, GitHub
-# reports each matrix entry as a separate check (e.g. "integration-matrix
-# (v3.3.0)"), so a single "integration-matrix" context never resolves. The
-# matrix still runs on every PR/push and is visible in the PR checks, but it
-# does not block merging.
+# Matrix jobs feed stable aggregate contexts so branch protection does not
+# depend on version-specific check names.
 
 # Check whether the repository belongs to an organization. User-owned
 # repositories do not support user/team push restrictions through the API.
@@ -43,9 +39,8 @@ for BRANCH in "${BRANCHES[@]}"; do
     "strict": true,
     "contexts": [
       "Validate source branch",
-      "unit-tests",
-      "e2e",
-      "build"
+      "quality / Quality gates",
+      "e2e / E2E stable"
     ]
   },
   "enforce_admins": false,
