@@ -8,13 +8,19 @@ services:
       - "443:443"
       - "8000:8000"
     environment:
+      # Required for this local-file source example.
       - CERT_SYNC_ALLOWED_SOURCE_ROOTS=/cert_warden_plugin
       - CERT_SYNC_ALLOWED_DESTINATION_ROOTS=/opt/zoraxy/config/conf/certs
+      # Remote sources use the system CA store. For a private CA, uncomment and
+      # mount a CA bundle below; do not disable TLS verification.
+      # - SSL_CERT_FILE=/etc/ssl/custom/cert-warden-ca.pem
     volumes:
       - /path/to/zoraxy/config:/opt/zoraxy/config
       - /path/to/zoraxy/plugin:/opt/zoraxy/plugin
       # Cert Warden Client output
       - /path/to/cert-warden/output:/cert_warden_plugin:ro
+      # Remote-only sources do not need the client output volume above.
+      # - /path/to/cert-warden-ca.pem:/etc/ssl/custom/cert-warden-ca.pem:ro
 
   # Optional: build and place the plugin binary into the plugin volume.
   # In production, copy the built binary manually or via CI/CD.

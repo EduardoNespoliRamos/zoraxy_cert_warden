@@ -44,6 +44,193 @@ func TestCertificateConfig_Validate_RelativePath(t *testing.T) {
 	}
 }
 
+func TestCertificateConfigNormalizeSourceType(t *testing.T) {
+	tests := []struct {
+		name string
+		got  SourceType
+		want SourceType
+	}{
+		{name: "legacy missing type becomes local", want: SourceTypeLocal},
+		{name: "explicit local remains local", got: SourceTypeLocal, want: SourceTypeLocal},
+		{name: "explicit Cert Warden remains remote", got: SourceTypeCertWarden, want: SourceTypeCertWarden},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := DefaultConfig().Certificates[0]
+			cfg.Source.Type = tt.got
+			cfg.Normalize()
+			if cfg.Source.Type != tt.want {
+				t.Fatalf("Normalize() source type = %q, want %q", cfg.Source.Type, tt.want)
+			}
+		})
+	}
+}
+
+func TestCertificateConfigValidateCertWardenHTTPSOrigins(t *testing.T) {
+	tests := []struct {
+		name string
+		url  string
+	}{
+		{name: "hostname", url: "https://certwarden.example.com"},
+		{name: "explicit port", url: "https://certwarden.example.com:8443"},
+		{name: "root path", url: "https://certwarden.example.com/"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := certWardenTestCertificate()
+			cfg.Source.CertWarden.ServerURL = tt.url
+			if err := cfg.Validate(false, broadTestPolicy(t)); err != nil {
+				t.Fatalf("Validate() rejected valid HTTPS origin %q: %v", tt.url, err)
+			}
+		})
+	}
+}
+
+func TestCertificateConfigValidateRejectsInvalidCertWardenOrigins(t *testing.T) {
+	tests := []struct {
+		name string
+		url  string
+	}{
+		{name: "HTTP", url: "http://certwarden.example.com"},
+		{name: "userinfo", url: "https://user:pass@certwarden.example.com"},
+		{name: "query", url: "https://certwarden.example.com?token=value"},
+		{name: "empty query", url: "https://certwarden.example.com?"},
+		{name: "fragment", url: "https://certwarden.example.com#section"},
+		{name: "empty fragment", url: "https://certwarden.example.com#"},
+		{name: "path", url: "https://certwarden.example.com/api"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := certWardenTestCertificate()
+			cfg.Source.CertWarden.ServerURL = tt.url
+			err := cfg.Validate(false, broadTestPolicy(t))
+			if err == nil || !strings.Contains(err.Error(), "must be an HTTPS origin") {
+				t.Fatalf("Validate() error = %v, want HTTPS origin error", err)
+			}
+		})
+	}
+}
+
+func TestCertificateConfigValidateRequiresCertWardenSettings(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(*CertificateConfig)
+		wantErr string
+	}{
+		{
+			name: "settings",
+			mutate: func(cfg *CertificateConfig) {
+				cfg.Source.CertWarden = nil
+			},
+			wantErr: "source settings are required",
+		},
+		{
+			name: "server URL",
+			mutate: func(cfg *CertificateConfig) {
+				cfg.Source.CertWarden.ServerURL = ""
+			},
+			wantErr: "must be an HTTPS origin",
+		},
+		{
+			name: "certificate name",
+			mutate: func(cfg *CertificateConfig) {
+				cfg.Source.CertWarden.CertificateName = " "
+			},
+			wantErr: "certificate name is required",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := certWardenTestCertificate()
+			tt.mutate(&cfg)
+			err := cfg.Validate(false, broadTestPolicy(t))
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("Validate() error = %v, want error containing %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestCertificateConfigValidateRejectsMixedSourceFields(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(*CertificateConfig)
+		wantErr string
+	}{
+		{
+			name: "local with Cert Warden settings",
+			mutate: func(cfg *CertificateConfig) {
+				local := DefaultConfig().Certificates[0]
+				*cfg = local
+				cfg.Source.Type = SourceTypeLocal
+				cfg.Source.CertWarden = &CertWardenSource{ServerURL: "https://certwarden.example.com", CertificateName: "example"}
+			},
+			wantErr: "not allowed for a local source",
+		},
+		{
+			name: "remote with certificate path",
+			mutate: func(cfg *CertificateConfig) {
+				cfg.Source.Certificate = "/source/cert.pem"
+			},
+			wantErr: "local file paths are not allowed",
+		},
+		{
+			name: "remote with private key path",
+			mutate: func(cfg *CertificateConfig) {
+				cfg.Source.PrivateKey = "/source/key.pem"
+			},
+			wantErr: "local file paths are not allowed",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := certWardenTestCertificate()
+			tt.mutate(&cfg)
+			err := cfg.Validate(false, broadTestPolicy(t))
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("Validate() error = %v, want error containing %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestCertificateConfigValidateRejectsCertWardenFilesystemWatch(t *testing.T) {
+	cfg := certWardenTestCertificate()
+	cfg.Sync.FilesystemWatch = true
+	if err := cfg.Validate(false, broadTestPolicy(t)); err == nil || !strings.Contains(err.Error(), "filesystem watch is not supported") {
+		t.Fatalf("expected unsupported filesystem watch error, got %v", err)
+	}
+}
+
+func TestCertificateConfigValidateCertWardenPollingBounds(t *testing.T) {
+	tests := []struct {
+		name           string
+		seconds        int
+		wantNormalized int
+		wantErr        bool
+	}{
+		{name: "default", seconds: 0, wantNormalized: DefaultRemotePollInterval},
+		{name: "below remote minimum", seconds: MinRemotePollIntervalSeconds - 1, wantNormalized: MinRemotePollIntervalSeconds - 1, wantErr: true},
+		{name: "remote minimum", seconds: MinRemotePollIntervalSeconds, wantNormalized: MinRemotePollIntervalSeconds},
+		{name: "maximum", seconds: MaxPollIntervalSeconds, wantNormalized: MaxPollIntervalSeconds},
+		{name: "above maximum", seconds: MaxPollIntervalSeconds + 1, wantNormalized: MaxPollIntervalSeconds + 1, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := certWardenTestCertificate()
+			cfg.Sync.PollIntervalSeconds = tt.seconds
+			cfg.Normalize()
+			if cfg.Sync.PollIntervalSeconds != tt.wantNormalized {
+				t.Fatalf("Normalize() poll interval = %d, want %d", cfg.Sync.PollIntervalSeconds, tt.wantNormalized)
+			}
+			err := cfg.Validate(false, broadTestPolicy(t))
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("Validate() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestConfigValidateAllowsEmptyCertificates(t *testing.T) {
 	cfg := &Config{LogLevel: "info", Certificates: []CertificateConfig{}}
 	if err := cfg.Validate(false, broadTestPolicy(t)); err != nil {
@@ -67,6 +254,42 @@ func TestConfigCloneIsDeep(t *testing.T) {
 	}
 	if len(original.Certificates) != 1 {
 		t.Fatalf("clone append changed original length: %d", len(original.Certificates))
+	}
+}
+
+func TestConfigCloneDeepCopiesCertWardenSource(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*CertWardenSource)
+	}{
+		{
+			name: "server URL",
+			mutate: func(source *CertWardenSource) {
+				source.ServerURL = "https://changed.example.com"
+			},
+		},
+		{
+			name: "certificate name",
+			mutate: func(source *CertWardenSource) {
+				source.CertificateName = "changed"
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cert := certWardenTestCertificate()
+			original := &Config{LogLevel: "info", Certificates: []CertificateConfig{cert}}
+			want := *original.Certificates[0].Source.CertWarden
+			clone := original.Clone()
+
+			if clone.Certificates[0].Source.CertWarden == original.Certificates[0].Source.CertWarden {
+				t.Fatal("Clone() shares its Cert Warden source pointer with the original")
+			}
+			tt.mutate(clone.Certificates[0].Source.CertWarden)
+			if got := *original.Certificates[0].Source.CertWarden; got != want {
+				t.Fatalf("mutating clone changed original source: got %#v, want %#v", got, want)
+			}
+		})
 	}
 }
 
@@ -224,6 +447,123 @@ func TestLoadAndSave(t *testing.T) {
 	}
 }
 
+func TestLoadSaveSourceSchemaMigrationAndRoundTrip(t *testing.T) {
+	tests := []struct {
+		name                string
+		data                string
+		wantType            SourceType
+		wantPoll            int
+		wantCertWarden      *CertWardenSource
+		wantSavedSourceType string
+	}{
+		{
+			name: "legacy local source",
+			data: `{
+  "certificates": [{
+    "name": "legacy",
+    "enabled": true,
+    "source": {
+      "certificate": "/source/cert.pem",
+      "private_key": "/source/key.pem"
+    },
+    "destination": {
+      "target_directory": "/destination",
+      "target_name": "legacy"
+    },
+    "sync": {
+      "auto_sync": true,
+      "filesystem_watch": true,
+      "poll_interval_seconds": 10
+    },
+    "fallback": false
+  }],
+  "log_level": "info"
+}`,
+			wantType:            SourceTypeLocal,
+			wantPoll:            DefaultPollInterval,
+			wantSavedSourceType: `"type": "local"`,
+		},
+		{
+			name: "Cert Warden source",
+			data: `{
+  "certificates": [{
+    "name": "remote",
+    "enabled": true,
+    "source": {
+      "type": "cert_warden",
+      "cert_warden": {
+        "server_url": "https://certwarden.example.com:8443",
+        "certificate_name": "example.com"
+      }
+    },
+    "destination": {
+      "target_directory": "/destination",
+      "target_name": "remote"
+    },
+    "sync": {
+      "auto_sync": true,
+      "filesystem_watch": false,
+      "poll_interval_seconds": 0
+    },
+    "fallback": false
+  }],
+  "log_level": "info"
+}`,
+			wantType: SourceTypeCertWarden,
+			wantPoll: DefaultRemotePollInterval,
+			wantCertWarden: &CertWardenSource{
+				ServerURL:       "https://certwarden.example.com:8443",
+				CertificateName: "example.com",
+			},
+			wantSavedSourceType: `"type": "cert_warden"`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			inputPath := filepath.Join(dir, "input.json")
+			if err := os.WriteFile(inputPath, []byte(tt.data), 0600); err != nil {
+				t.Fatal(err)
+			}
+
+			loaded, err := Load(inputPath, broadTestPolicy(t))
+			if err != nil {
+				t.Fatalf("Load() failed: %v", err)
+			}
+			source := loaded.Certificates[0].Source
+			if source.Type != tt.wantType {
+				t.Fatalf("Load() source type = %q, want %q", source.Type, tt.wantType)
+			}
+			if loaded.Certificates[0].Sync.PollIntervalSeconds != tt.wantPoll {
+				t.Fatalf("Load() poll interval = %d, want %d", loaded.Certificates[0].Sync.PollIntervalSeconds, tt.wantPoll)
+			}
+			if !reflect.DeepEqual(source.CertWarden, tt.wantCertWarden) {
+				t.Fatalf("Load() Cert Warden source = %#v, want %#v", source.CertWarden, tt.wantCertWarden)
+			}
+
+			savedPath := filepath.Join(dir, "saved.json")
+			if err := loaded.Save(savedPath, broadTestPolicy(t)); err != nil {
+				t.Fatalf("Save() failed: %v", err)
+			}
+			saved, err := os.ReadFile(savedPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(saved), tt.wantSavedSourceType) {
+				t.Fatalf("saved JSON does not contain normalized source type %s:\n%s", tt.wantSavedSourceType, saved)
+			}
+
+			roundTripped, err := Load(savedPath, broadTestPolicy(t))
+			if err != nil {
+				t.Fatalf("round-trip Load() failed: %v", err)
+			}
+			if !reflect.DeepEqual(roundTripped, loaded) {
+				t.Fatalf("round-trip mismatch:\n got: %#v\nwant: %#v", roundTripped, loaded)
+			}
+		})
+	}
+}
+
 func TestLoad_DefaultWhenMissing(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "nonexistent.json")
@@ -346,6 +686,20 @@ func TestLoadRejectsOutOfPolicyConfig(t *testing.T) {
 	if _, err := Load(path, policy); err == nil {
 		t.Fatal("expected out-of-policy config to be rejected")
 	}
+}
+
+func certWardenTestCertificate() CertificateConfig {
+	cfg := DefaultConfig().Certificates[0]
+	cfg.Source = CertificateSource{
+		Type: SourceTypeCertWarden,
+		CertWarden: &CertWardenSource{
+			ServerURL:       "https://certwarden.example.com",
+			CertificateName: "example.com",
+		},
+	}
+	cfg.Sync.FilesystemWatch = false
+	cfg.Sync.PollIntervalSeconds = DefaultRemotePollInterval
+	return cfg
 }
 
 func broadTestPolicy(t *testing.T) *PathPolicy {

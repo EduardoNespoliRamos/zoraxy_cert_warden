@@ -20,7 +20,10 @@ import (
 	plugin "github.com/eduardoramos/zoraxy-cert-warden/mod/zoraxy_plugin"
 
 	"github.com/eduardoramos/zoraxy-cert-warden/internal/certutil"
+	"github.com/eduardoramos/zoraxy-cert-warden/internal/certwarden"
 	"github.com/eduardoramos/zoraxy-cert-warden/internal/config"
+	"github.com/eduardoramos/zoraxy-cert-warden/internal/poller"
+	"github.com/eduardoramos/zoraxy-cert-warden/internal/secretstore"
 	"github.com/eduardoramos/zoraxy-cert-warden/internal/status"
 	certSync "github.com/eduardoramos/zoraxy-cert-warden/internal/sync"
 	"github.com/eduardoramos/zoraxy-cert-warden/internal/watcher"
@@ -42,16 +45,18 @@ var content embed.FS
 var Version = "dev"
 
 type manager struct {
-	mu         sync.RWMutex // protects only active snapshots and runtime handles
-	applyMu    sync.Mutex
-	cfg        *config.Config
-	states     map[string]*status.State
-	watchers   map[string]managedWatcher
-	generation uint64
-	configPath string
-	logger     *slog.Logger
-	logLevel   *slog.LevelVar
-	policy     *config.PathPolicy
+	mu          sync.RWMutex // protects only active snapshots and runtime handles
+	applyMu     sync.Mutex
+	cfg         *config.Config
+	states      map[string]*status.State
+	watchers    map[string]managedWatcher
+	generation  uint64
+	configPath  string
+	secretsPath string
+	secrets     secretstore.Data
+	logger      *slog.Logger
+	logLevel    *slog.LevelVar
+	policy      *config.PathPolicy
 
 	destinationMu    sync.Mutex
 	destinationLocks map[string]*sync.Mutex
@@ -62,10 +67,18 @@ type manager struct {
 	runtimeLoaded    bool
 
 	saveConfig          func(*config.Config, string, *config.PathPolicy) error
+	saveSecrets         func(string, secretstore.Data) error
 	watcherFactory      func([]string, time.Duration, time.Duration, bool, func(), *config.PathPolicy) (managedWatcher, error)
+	pollerFactory       func(time.Duration, func(context.Context)) managedWatcher
 	syncFunc            func(config.CertificateConfig, *config.PathPolicy) (*certutil.CertInfo, *certSync.Result, error)
+	syncMaterialFunc    func(config.CertificateConfig, []byte, []byte, *config.PathPolicy) (*certutil.CertInfo, *certSync.Result, error)
 	validateFunc        func(string, string) (*certutil.CertInfo, error)
 	readDestinationFunc func(string, string, *config.PathPolicy) (*certutil.CertInfo, error)
+	remoteClientFactory func(string, certwarden.Credentials) (remoteFetcher, error)
+}
+
+type remoteFetcher interface {
+	Fetch(context.Context, string) (certwarden.Material, error)
 }
 
 type managedWatcher interface {
@@ -115,6 +128,7 @@ func main() {
 	}
 	pluginDir := filepath.Dir(execPath)
 	configPath := filepath.Join(pluginDir, "config.json")
+	secretsPath := filepath.Join(pluginDir, "secrets.json")
 
 	policy, err := config.PathPolicyFromEnv()
 	if err != nil {
@@ -127,15 +141,22 @@ func main() {
 		logger.Error("failed to load config", "error", err)
 		os.Exit(1)
 	}
+	secrets, err := secretstore.Load(secretsPath)
+	if err != nil {
+		logger.Error("failed to load secrets", "error", err)
+		os.Exit(1)
+	}
 
 	m := &manager{
-		cfg:        &config.Config{LogLevel: "info"},
-		states:     make(map[string]*status.State),
-		watchers:   make(map[string]managedWatcher),
-		configPath: configPath,
-		logger:     logger,
-		logLevel:   logLevel,
-		policy:     policy,
+		cfg:         &config.Config{LogLevel: "info"},
+		states:      make(map[string]*status.State),
+		watchers:    make(map[string]managedWatcher),
+		configPath:  configPath,
+		secretsPath: secretsPath,
+		secrets:     secrets,
+		logger:      logger,
+		logLevel:    logLevel,
+		policy:      policy,
 	}
 
 	if err := m.ApplyConfig(context.Background(), cfg); err != nil {
@@ -185,7 +206,7 @@ func pluginSpec() *plugin.IntroSpect {
 		Name:          "Zoraxy Cert Warden Sync",
 		Author:        "Eduardo Ramos",
 		AuthorContact: "",
-		Description:   "Synchronizes certificates from Cert Warden Client into Zoraxy TLS store.",
+		Description:   "Synchronizes certificates from local files or Cert Warden into Zoraxy TLS store.",
 		URL:           "https://github.com/EduardoNespoliRamos/zoraxy_cert_warden",
 		Type:          plugin.PluginType_Utilities,
 		VersionMajor:  major,
@@ -225,19 +246,35 @@ func (m *manager) defaults() {
 				return cfg.Save(path, policy)
 			}
 		}
+		if m.saveSecrets == nil {
+			m.saveSecrets = secretstore.Save
+		}
 		if m.watcherFactory == nil {
 			m.watcherFactory = func(paths []string, poll, debounce time.Duration, fsnotify bool, callback func(), policy *config.PathPolicy) (managedWatcher, error) {
 				return watcher.New(paths, poll, debounce, fsnotify, callback, policy)
 			}
 		}
+		if m.pollerFactory == nil {
+			m.pollerFactory = func(interval time.Duration, callback func(context.Context)) managedWatcher {
+				return poller.New(interval, callback)
+			}
+		}
 		if m.syncFunc == nil {
 			m.syncFunc = certSync.Sync
+		}
+		if m.syncMaterialFunc == nil {
+			m.syncMaterialFunc = certSync.SyncMaterial
 		}
 		if m.validateFunc == nil {
 			m.validateFunc = certutil.LoadAndValidate
 		}
 		if m.readDestinationFunc == nil {
 			m.readDestinationFunc = certSync.ReadDestinationInfo
+		}
+		if m.remoteClientFactory == nil {
+			m.remoteClientFactory = func(baseURL string, credentials certwarden.Credentials) (remoteFetcher, error) {
+				return certwarden.NewClient(baseURL, credentials, nil)
+			}
 		}
 	})
 }
@@ -269,7 +306,7 @@ func (m *manager) SnapshotStatus() []status.CertificateStatus {
 func (m *manager) ApplyConfig(ctx context.Context, candidate *config.Config) error {
 	m.applyMu.Lock()
 	defer m.applyMu.Unlock()
-	return m.applyConfigLocked(ctx, candidate)
+	return m.applyConfigAndSecretsLocked(ctx, candidate, m.currentSecrets())
 }
 
 // MutateConfig creates its candidate after entering the apply serialization,
@@ -284,7 +321,149 @@ func (m *manager) MutateConfig(ctx context.Context, mutation web.ConfigMutation)
 	if err := mutation(candidate); err != nil {
 		return err
 	}
-	return m.applyConfigLocked(ctx, candidate)
+	return m.applyConfigAndSecretsLocked(ctx, candidate, m.currentSecrets())
+}
+
+func (m *manager) MutateConfigAndCredentials(ctx context.Context, mutation web.ConfigMutation, credentialMutation *web.CredentialMutation) error {
+	m.applyMu.Lock()
+	defer m.applyMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	candidate := m.SnapshotConfig()
+	if err := mutation(candidate); err != nil {
+		return err
+	}
+	oldSecrets := m.currentSecrets()
+	nextSecrets := oldSecrets.Clone()
+	if credentialMutation != nil {
+		if credentialMutation.Delete {
+			delete(nextSecrets, credentialMutation.Name)
+		} else if credentialMutation.CertificateAPIKey != nil || credentialMutation.PrivateKeyAPIKey != nil {
+			if credentialMutation.CertificateAPIKey == nil || credentialMutation.PrivateKeyAPIKey == nil {
+				return configValidationError{err: fmt.Errorf("both Cert Warden API keys are required")}
+			}
+			certKey := strings.TrimSpace(*credentialMutation.CertificateAPIKey)
+			privateKey := strings.TrimSpace(*credentialMutation.PrivateKeyAPIKey)
+			if certKey == "" && privateKey == "" {
+				if _, ok := nextSecrets.Get(credentialMutation.Name); !ok {
+					return configValidationError{err: fmt.Errorf("remote API credentials are required")}
+				}
+			} else {
+				if certKey == "" || privateKey == "" {
+					return configValidationError{err: fmt.Errorf("both Cert Warden API keys are required")}
+				}
+				serverURL, certificateName, ok := remoteIdentity(candidate, credentialMutation.Name)
+				if !ok {
+					return configValidationError{err: fmt.Errorf("remote source settings are required")}
+				}
+				nextSecrets[credentialMutation.Name] = secretstore.Credentials{
+					CertificateAPIKey: certKey,
+					PrivateKeyAPIKey:  privateKey,
+					ServerURL:         serverURL,
+					CertificateName:   certificateName,
+				}
+			}
+		}
+	}
+	return m.applyConfigAndSecretsLocked(ctx, candidate, nextSecrets)
+}
+
+func remoteIdentity(cfg *config.Config, name string) (string, string, bool) {
+	if cfg == nil {
+		return "", "", false
+	}
+	for _, certCfg := range cfg.Certificates {
+		if certCfg.Name == name && certCfg.Source.Type == config.SourceTypeCertWarden && certCfg.Source.CertWarden != nil {
+			return certCfg.Source.CertWarden.ServerURL, certCfg.Source.CertWarden.CertificateName, true
+		}
+	}
+	return "", "", false
+}
+
+func (m *manager) CredentialsConfigured(name string) (bool, bool) {
+	credentials, ok := m.credentialsFor(name)
+	if !ok {
+		return false, false
+	}
+	return credentials.CertificateAPIKey != "", credentials.PrivateKeyAPIKey != ""
+}
+
+func (m *manager) credentialsFor(name string) (secretstore.Credentials, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.secrets.Get(name)
+}
+
+func (m *manager) currentSecrets() secretstore.Data {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.secrets.Clone()
+}
+
+func validateRemoteCredentials(cfg *config.Config, secrets secretstore.Data) error {
+	if cfg == nil {
+		return fmt.Errorf("configuration is required")
+	}
+	for _, certCfg := range cfg.Certificates {
+		if certCfg.Source.Type != config.SourceTypeCertWarden {
+			continue
+		}
+		credentials, ok := secrets.Get(certCfg.Name)
+		if !ok || credentials.CertificateAPIKey == "" || credentials.PrivateKeyAPIKey == "" || certCfg.Source.CertWarden == nil ||
+			credentials.ServerURL != certCfg.Source.CertWarden.ServerURL || credentials.CertificateName != certCfg.Source.CertWarden.CertificateName {
+			return fmt.Errorf("certificate %s: Cert Warden API credentials are required", certCfg.Name)
+		}
+	}
+	return nil
+}
+
+func pruneSecrets(cfg *config.Config, secrets secretstore.Data) secretstore.Data {
+	pruned := make(secretstore.Data)
+	if cfg == nil {
+		return pruned
+	}
+	for _, certCfg := range cfg.Certificates {
+		if certCfg.Source.Type == config.SourceTypeCertWarden {
+			if credentials, ok := secrets.Get(certCfg.Name); ok {
+				pruned[certCfg.Name] = credentials
+			}
+		}
+	}
+	return pruned
+}
+
+func secretsEqual(a, b secretstore.Data) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for name, credentials := range a {
+		if other, ok := b.Get(name); !ok || other != credentials {
+			return false
+		}
+	}
+	return true
+}
+
+func (m *manager) applyConfigAndSecretsLocked(ctx context.Context, candidate *config.Config, requestedSecrets secretstore.Data) error {
+	oldSecrets := m.currentSecrets()
+	nextSecrets := pruneSecrets(candidate, requestedSecrets)
+	if err := validateRemoteCredentials(candidate, nextSecrets); err != nil {
+		return configValidationError{err: err}
+	}
+	secretsChanged := !secretsEqual(oldSecrets, nextSecrets)
+	if secretsChanged {
+		if err := m.saveSecrets(m.secretsPath, nextSecrets); err != nil {
+			return fmt.Errorf("persist credentials: %w", err)
+		}
+	}
+	if err := m.applyConfigLocked(ctx, candidate, nextSecrets); err != nil {
+		if secretsChanged {
+			return errors.Join(err, m.saveSecrets(m.secretsPath, oldSecrets))
+		}
+		return err
+	}
+	return nil
 }
 
 // ReloadConfig remains the non-HTTP compatibility entry point.
@@ -292,7 +471,7 @@ func (m *manager) ReloadConfig(cfg *config.Config) error {
 	return m.ApplyConfig(context.Background(), cfg)
 }
 
-func (m *manager) applyConfigLocked(ctx context.Context, candidate *config.Config) error {
+func (m *manager) applyConfigLocked(ctx context.Context, candidate *config.Config, stagedSecrets secretstore.Data) error {
 	m.defaults()
 	if err := ctx.Err(); err != nil {
 		return err
@@ -306,6 +485,9 @@ func (m *manager) applyConfigLocked(ctx context.Context, candidate *config.Confi
 		if isConfigConflict(err) {
 			return configConflictError{err: err}
 		}
+		return configValidationError{err: err}
+	}
+	if err := validateRemoteCredentials(staged, stagedSecrets); err != nil {
 		return configValidationError{err: err}
 	}
 	if err := m.loadRuntimeState(); err != nil {
@@ -324,12 +506,21 @@ func (m *manager) applyConfigLocked(ctx context.Context, candidate *config.Confi
 			continue
 		}
 		name := certCfg.Name
-		watch, err := m.watcherFactory(
-			[]string{certCfg.Source.Certificate, certCfg.Source.PrivateKey},
-			time.Duration(certCfg.Sync.PollIntervalSeconds)*time.Second,
-			2*time.Second, certCfg.Sync.FilesystemWatch,
-			func() { _ = m.syncGeneration(name, generation) }, m.policy,
-		)
+		var watch managedWatcher
+		var err error
+		if certCfg.Source.Type == config.SourceTypeCertWarden {
+			watch = m.pollerFactory(
+				time.Duration(certCfg.Sync.PollIntervalSeconds)*time.Second,
+				func(ctx context.Context) { _ = m.syncGenerationContext(ctx, name, generation) },
+			)
+		} else {
+			watch, err = m.watcherFactory(
+				[]string{certCfg.Source.Certificate, certCfg.Source.PrivateKey},
+				time.Duration(certCfg.Sync.PollIntervalSeconds)*time.Second,
+				2*time.Second, certCfg.Sync.FilesystemWatch,
+				func() { _ = m.syncGeneration(name, generation) }, m.policy,
+			)
+		}
 		if err != nil {
 			stopWatchers(newWatchers)
 			return err
@@ -378,6 +569,7 @@ func (m *manager) applyConfigLocked(ctx context.Context, candidate *config.Confi
 	m.mu.Lock()
 	oldWatchers := m.watchers
 	m.cfg = staged
+	m.secrets = stagedSecrets.Clone()
 	m.states = newStates
 	m.watchers = newWatchers
 	m.generation = generation
@@ -421,10 +613,14 @@ func (m *manager) SyncCertificate(name string) error {
 	m.mu.RLock()
 	generation := m.generation
 	m.mu.RUnlock()
-	return m.syncGeneration(name, generation)
+	return m.syncGenerationContext(context.Background(), name, generation)
 }
 
 func (m *manager) syncGeneration(name string, generation uint64) error {
+	return m.syncGenerationContext(context.Background(), name, generation)
+}
+
+func (m *manager) syncGenerationContext(ctx context.Context, name string, generation uint64) error {
 	m.defaults()
 	m.mu.RLock()
 	state, ok := m.states[name]
@@ -451,18 +647,42 @@ func (m *manager) syncGeneration(name string, generation uint64) error {
 	lock := m.destinationLock(filepath.Join(destination, cfg.Destination.TargetName))
 	lock.Lock()
 	defer lock.Unlock()
-	if !m.isGenerationActive(name, generation) {
-		return nil
+	var info *certutil.CertInfo
+	var result *certSync.Result
+	var syncErr error
+	var modified time.Time
+	var material certwarden.Material
+	if cfg.Source.Type == config.SourceTypeCertWarden {
+		var fetchErr error
+		material, fetchErr = m.fetchRemote(ctx, name, generation, cfg)
+		if fetchErr != nil {
+			m.logger.Error("Cert Warden query failed", "certificate", name, "error", fetchErr)
+			return fetchErr
+		}
 	}
 
-	info, result, syncErr := m.syncFunc(cfg, m.policy)
+	// Keep configuration activation from overtaking publication by an operation
+	// that started under the previous generation.
+	m.mu.RLock()
+	_, stillActive := m.states[name]
+	if !stillActive || m.generation != generation {
+		m.mu.RUnlock()
+		return nil
+	}
+	if cfg.Source.Type == config.SourceTypeCertWarden {
+		modified = material.RetrievedAt
+		info, result, syncErr = m.syncMaterialFunc(cfg, material.CertificatePEM, material.PrivateKeyPEM, m.policy)
+	} else {
+		info, result, syncErr = m.syncFunc(cfg, m.policy)
+	}
 	if syncErr != nil && info == nil && !isFilesystemError(syncErr) {
 		syncErr = sourceValidationError{err: syncErr}
 	}
-	var modified time.Time
-	if sourcePath, resolveErr := m.policy.ResolveSource(cfg.Source.Certificate, true); resolveErr == nil {
-		if fileInfo, statErr := os.Stat(sourcePath); statErr == nil {
-			modified = fileInfo.ModTime()
+	if cfg.Source.Type == config.SourceTypeLocal {
+		if sourcePath, resolveErr := m.policy.ResolveSource(cfg.Source.Certificate, true); resolveErr == nil {
+			if fileInfo, statErr := os.Stat(sourcePath); statErr == nil {
+				modified = fileInfo.ModTime()
+			}
 		}
 	}
 	var destinationInfo *certutil.CertInfo
@@ -477,11 +697,87 @@ func (m *manager) syncGeneration(name string, generation uint64) error {
 			syncErr = errors.Join(syncErr, fmt.Errorf("persist fallback restart state: %w", pendingErr))
 		}
 	}
+	m.mu.RUnlock()
 	m.recordSync(name, generation, info, result, modified, destinationInfo, destinationErr, destination, syncErr)
 	if syncErr != nil {
 		m.logger.Error("cert-sync failed", "certificate", name, "error", syncErr)
 	}
 	return syncErr
+}
+
+func (m *manager) fetchRemote(ctx context.Context, name string, generation uint64, cfg config.CertificateConfig) (certwarden.Material, error) {
+	m.mu.Lock()
+	state, ok := m.states[name]
+	if !ok || m.generation != generation {
+		m.mu.Unlock()
+		return certwarden.Material{}, context.Canceled
+	}
+	if state.CertWardenQuery == nil {
+		state.CertWardenQuery = &status.CertWardenQueryStatus{Status: status.StatusUnknown}
+	}
+	state.CertWardenQuery.InProgress = true
+	state.CertWardenQuery.Message = "Querying Cert Warden"
+	credentials, credentialsOK := m.secrets.Get(name)
+	m.mu.Unlock()
+
+	if !credentialsOK {
+		err := &certwarden.FetchError{Kind: certwarden.ErrorKindAuthentication}
+		m.recordRemoteQuery(name, generation, certwarden.Material{}, err, cfg)
+		return certwarden.Material{}, err
+	}
+	if cfg.Source.CertWarden == nil || credentials.ServerURL != cfg.Source.CertWarden.ServerURL || credentials.CertificateName != cfg.Source.CertWarden.CertificateName {
+		err := &certwarden.FetchError{Kind: certwarden.ErrorKindAuthentication}
+		m.recordRemoteQuery(name, generation, certwarden.Material{}, err, cfg)
+		return certwarden.Material{}, err
+	}
+	client, err := m.remoteClientFactory(cfg.Source.CertWarden.ServerURL, certwarden.Credentials{
+		CertificateAPIKey: credentials.CertificateAPIKey,
+		PrivateKeyAPIKey:  credentials.PrivateKeyAPIKey,
+	})
+	if err != nil {
+		m.recordRemoteQuery(name, generation, certwarden.Material{}, err, cfg)
+		return certwarden.Material{}, err
+	}
+	material, err := client.Fetch(ctx, cfg.Source.CertWarden.CertificateName)
+	m.recordRemoteQuery(name, generation, material, err, cfg)
+	return material, err
+}
+
+func (m *manager) recordRemoteQuery(name string, generation uint64, material certwarden.Material, queryErr error, cfg config.CertificateConfig) {
+	now := time.Now()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	state, ok := m.states[name]
+	if !ok || m.generation != generation {
+		return
+	}
+	if state.CertWardenQuery == nil {
+		state.CertWardenQuery = &status.CertWardenQueryStatus{}
+	}
+	query := state.CertWardenQuery
+	query.InProgress = false
+	query.LastAttempt = &now
+	query.HTTPStatus = material.HTTPStatus
+	query.LatencyMillis = material.Latency.Milliseconds()
+	query.NextAttempt = nil
+	if cfg.Sync.AutoSync {
+		next := now.Add(time.Duration(cfg.Sync.PollIntervalSeconds) * time.Second)
+		query.NextAttempt = &next
+	}
+	if queryErr == nil {
+		query.Status = status.StatusHealthy
+		query.LastSuccess = &now
+		query.FailureKind = ""
+		query.Message = "Certificate bundle downloaded"
+		return
+	}
+	query.Status = status.StatusError
+	query.Message = "Cert Warden query failed"
+	var fetchErr *certwarden.FetchError
+	if errors.As(queryErr, &fetchErr) {
+		query.FailureKind = string(fetchErr.Kind)
+		query.HTTPStatus = fetchErr.HTTPStatus
+	}
 }
 
 func (m *manager) recordSync(name string, generation uint64, info *certutil.CertInfo, result *certSync.Result, modified time.Time, destinationInfo *certutil.CertInfo, destinationErr error, fallbackDestination string, syncErr error) {
@@ -748,6 +1044,18 @@ func (m *manager) ValidateCertificate(name string) error {
 	}
 	cfg := state.Config
 	m.mu.RUnlock()
+	if cfg.Source.Type == config.SourceTypeCertWarden {
+		material, err := m.fetchRemote(context.Background(), name, generation, cfg)
+		if err != nil {
+			return err
+		}
+		info, err := certutil.ValidatePEMPair(material.CertificatePEM, material.PrivateKeyPEM)
+		if err != nil {
+			err = sourceValidationError{err: err}
+		}
+		m.recordValidation(name, generation, info, err)
+		return err
+	}
 
 	certPath, err := m.policy.ResolveSource(cfg.Source.Certificate, true)
 	if err == nil {
@@ -765,6 +1073,24 @@ func (m *manager) ValidateCertificate(name string) error {
 	}
 	m.recordValidation(name, generation, nil, err)
 	return err
+}
+
+func (m *manager) TestCertWardenConnection(ctx context.Context, serverURL, certificateName, certificateAPIKey, privateKeyAPIKey string) error {
+	client, err := m.remoteClientFactory(strings.TrimSpace(serverURL), certwarden.Credentials{
+		CertificateAPIKey: strings.TrimSpace(certificateAPIKey),
+		PrivateKeyAPIKey:  strings.TrimSpace(privateKeyAPIKey),
+	})
+	if err != nil {
+		return configValidationError{err: err}
+	}
+	material, err := client.Fetch(ctx, strings.TrimSpace(certificateName))
+	if err != nil {
+		return err
+	}
+	if _, err := certutil.ValidatePEMPair(material.CertificatePEM, material.PrivateKeyPEM); err != nil {
+		return sourceValidationError{err: err}
+	}
+	return nil
 }
 
 func isFilesystemError(err error) bool {
@@ -787,13 +1113,6 @@ func (m *manager) recordValidation(name string, generation uint64, info *certuti
 		state.SourceFingerprint = info.Fingerprint
 		state.SourceDigest = info.BundleDigest
 	}
-}
-
-func (m *manager) isGenerationActive(name string, generation uint64) bool {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	_, ok := m.states[name]
-	return ok && m.generation == generation
 }
 
 func (m *manager) destinationLock(destination string) *sync.Mutex {

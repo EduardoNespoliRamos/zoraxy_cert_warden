@@ -16,7 +16,7 @@ jobs:
     name: Formatting
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ inputs.ref }}
       - run: DOCKER=docker make fmt-check
@@ -25,7 +25,7 @@ jobs:
     name: Unit tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ inputs.ref }}
       - run: DOCKER=docker make test
@@ -34,7 +34,7 @@ jobs:
     name: Race detector
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ inputs.ref }}
       - run: DOCKER=docker make race
@@ -43,7 +43,7 @@ jobs:
     name: Go vet
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ inputs.ref }}
       - run: DOCKER=docker make vet
@@ -52,7 +52,7 @@ jobs:
     name: Static analysis
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ inputs.ref }}
       - run: DOCKER=docker make staticcheck
@@ -62,7 +62,7 @@ jobs:
     name: Repeated watcher and sync tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ inputs.ref }}
       - run: DOCKER=docker make repeat-test
@@ -71,16 +71,34 @@ jobs:
     name: Filesystem integration tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ inputs.ref }}
       - run: DOCKER=docker make integration-test
+
+  certwarden-api:
+    name: Cert Warden API integration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
+      - run: DOCKER=docker make certwarden-api-test
+
+  workflow-lint:
+    name: GitHub Actions lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
+      - run: DOCKER=docker make actionlint
 
   build:
     name: Build amd64 and arm64
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ inputs.ref }}
       - run: DOCKER=docker make build-all
@@ -89,7 +107,7 @@ jobs:
     name: Quality gates
     if: always()
     runs-on: ubuntu-latest
-    needs: [formatting, unit, race, vet, analyzers, repeated, integration, build]
+    needs: [formatting, unit, race, vet, analyzers, repeated, integration, certwarden-api, workflow-lint, build]
     steps:
       - name: Require every quality gate
         env:

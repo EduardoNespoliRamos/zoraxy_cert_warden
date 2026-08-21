@@ -3,7 +3,16 @@ set -e
 
 PLUGIN_ID="${PLUGIN_ID:-com.eduardoramos.zoraxy.certwarden}"
 ZORAXY_URL="${ZORAXY_URL:-http://zoraxy:8000}"
+E2E_SUITE="${E2E_SUITE:-compatibility}"
 COOKIE_JAR="/tmp/cookies.txt"
+
+case "$E2E_SUITE" in
+  compatibility|certwarden-api) ;;
+  *)
+    echo "Unknown E2E_SUITE: $E2E_SUITE" >&2
+    exit 1
+    ;;
+esac
 
 echo "Waiting for Zoraxy at $ZORAXY_URL..."
 zoraxy_ready=false
@@ -59,5 +68,5 @@ if [[ "$plugin_ready" != true ]]; then
 fi
 
 echo ""
-echo "Running E2E tests..."
+echo "Running $E2E_SUITE E2E tests..."
 npx playwright test

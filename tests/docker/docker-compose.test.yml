@@ -9,6 +9,18 @@ services:
     volumes:
       - certs:/certs
 
+  cert-warden-mock:
+    build:
+      context: ../..
+      dockerfile: tests/docker/Dockerfile.cert-warden-mock
+    volumes:
+      - test-ca:/test-ca
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+
   plugin-build:
     build:
       context: ../..
@@ -24,13 +36,17 @@ services:
     image: zoraxydocker/zoraxy:${ZORAXY_VERSION:-v3.3.3}
     environment:
       - NOAUTH=true
+      - SSL_CERT_FILE=/test-ca/ca.pem
     volumes:
       - zoraxy-config:/opt/zoraxy/config
       - zoraxy-plugin:/opt/zoraxy/plugin
       - certs:/cert_warden_plugin:ro
+      - test-ca:/test-ca:ro
     depends_on:
       plugin-build:
         condition: service_completed_successfully
+      cert-warden-mock:
+        condition: service_healthy
     ports:
       - "8000:8000"
 
@@ -54,10 +70,17 @@ services:
       dockerfile: tests/docker/Dockerfile.e2e
     environment:
       ZORAXY_URL: http://zoraxy:8000
+      CERT_WARDEN_CONTROL_URL: http://cert-warden-mock:8080
+      E2E_SUITE: ${E2E_SUITE:-compatibility}
+      CI: ${CI:-}
     depends_on:
-      - zoraxy
+      zoraxy:
+        condition: service_started
+      cert-warden-mock:
+        condition: service_healthy
 
 volumes:
   certs:
   zoraxy-config:
   zoraxy-plugin:
+  test-ca:
