@@ -1,7 +1,7 @@
 # Zoraxy Cert Warden Sync
 
-![CI](https://github.com/eduardoramos/zoraxy-cert-warden/actions/workflows/ci.yml/badge.svg?branch=main)
-![Compatibility](https://github.com/eduardoramos/zoraxy-cert-warden/actions/workflows/compatibility.yml/badge.svg?branch=main)
+![CI](https://github.com/EduardoNespoliRamos/zoraxy_cert_warden/actions/workflows/ci.yml/badge.svg?branch=main)
+![Compatibility](https://github.com/EduardoNespoliRamos/zoraxy_cert_warden/actions/workflows/compatibility.yml/badge.svg?branch=main)
 
 > **Built with vibe coding.** This project was developed iteratively with
 > AI-assisted pair programming. The codebase, tests, CI, and documentation were
