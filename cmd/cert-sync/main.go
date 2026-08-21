@@ -43,28 +43,7 @@ type manager struct {
 }
 
 func main() {
-	runtimeCfg, err := plugin.ServeAndRecvSpec(&plugin.IntroSpect{
-		ID:            pluginID,
-		Name:          "Zoraxy Cert Warden Sync",
-		Author:        "Eduardo Ramos",
-		AuthorContact: "",
-		Description:   "Synchronizes certificates from Cert Warden Client into Zoraxy TLS store.",
-		URL:           "https://github.com/EduardoNespoliRamos/zoraxy_cert_warden",
-		Type:          plugin.PluginType_Utilities,
-		VersionMajor:  1,
-		VersionMinor:  0,
-		VersionPatch:  0,
-		UIPath:        uiPath,
-		PermittedAPIEndpoints: []plugin.PermittedAPIEndpoint{
-			{Method: "GET", Endpoint: "/plugin.ui/com.eduardoramos.zoraxy.certwarden/api/status", Reason: "Read plugin status"},
-			{Method: "GET", Endpoint: "/plugin.ui/com.eduardoramos.zoraxy.certwarden/api/config", Reason: "Read plugin config"},
-			{Method: "POST", Endpoint: "/plugin.ui/com.eduardoramos.zoraxy.certwarden/api/config", Reason: "Update plugin config"},
-			{Method: "GET", Endpoint: "/plugin.ui/com.eduardoramos.zoraxy.certwarden/api/certificates", Reason: "List certificates"},
-			{Method: "POST", Endpoint: "/plugin.ui/com.eduardoramos.zoraxy.certwarden/api/certificates/*/validate", Reason: "Validate certificate"},
-			{Method: "POST", Endpoint: "/plugin.ui/com.eduardoramos.zoraxy.certwarden/api/certificates/*/sync", Reason: "Sync certificate"},
-			{Method: "POST", Endpoint: "/plugin.ui/com.eduardoramos.zoraxy.certwarden/api/certificates/*/toggle", Reason: "Toggle certificate"},
-		},
-	})
+	runtimeCfg, err := plugin.ServeAndRecvSpec(pluginSpec())
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to receive configure spec: %v\n", err)
 		os.Exit(1)
@@ -127,6 +106,22 @@ func main() {
 	if err := http.ListenAndServe(addr, mux); err != nil {
 		logger.Error("http server error", "error", err)
 		os.Exit(1)
+	}
+}
+
+func pluginSpec() *plugin.IntroSpect {
+	return &plugin.IntroSpect{
+		ID:            pluginID,
+		Name:          "Zoraxy Cert Warden Sync",
+		Author:        "Eduardo Ramos",
+		AuthorContact: "",
+		Description:   "Synchronizes certificates from Cert Warden Client into Zoraxy TLS store.",
+		URL:           "https://github.com/EduardoNespoliRamos/zoraxy_cert_warden",
+		Type:          plugin.PluginType_Utilities,
+		VersionMajor:  1,
+		VersionMinor:  0,
+		VersionPatch:  0,
+		UIPath:        uiPath,
 	}
 }
 
