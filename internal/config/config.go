@@ -80,8 +80,11 @@ func DefaultConfig() *Config {
 
 var validNameRegex = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
 
-// Validate checks a single certificate configuration.
-func (c *CertificateConfig) Validate(checkPaths bool) error {
+// Validate checks a single certificate configuration against the path policy.
+func (c *CertificateConfig) Validate(checkPaths bool, policy *PathPolicy) error {
+	if policy == nil {
+		return fmt.Errorf("path policy is required")
+	}
 	c.Name = strings.TrimSpace(c.Name)
 	if c.Name == "" {
 		return fmt.Errorf("certificate name is required")
@@ -90,11 +93,21 @@ func (c *CertificateConfig) Validate(checkPaths bool) error {
 		return fmt.Errorf("certificate name contains invalid characters")
 	}
 
-	if err := validatePath(c.Source.Certificate, "source certificate", checkPaths, false); err != nil {
+	c.Source.Certificate = strings.TrimSpace(c.Source.Certificate)
+	if err := validatePath(c.Source.Certificate, "source certificate"); err != nil {
 		return err
 	}
-	if err := validatePath(c.Source.PrivateKey, "source private key", checkPaths, false); err != nil {
+	_, err := policy.ResolveSource(c.Source.Certificate, checkPaths)
+	if err != nil {
+		return fmt.Errorf("source certificate: %w", err)
+	}
+	c.Source.PrivateKey = strings.TrimSpace(c.Source.PrivateKey)
+	if err := validatePath(c.Source.PrivateKey, "source private key"); err != nil {
 		return err
+	}
+	_, err = policy.ResolveSource(c.Source.PrivateKey, checkPaths)
+	if err != nil {
+		return fmt.Errorf("source private key: %w", err)
 	}
 
 	c.Destination.TargetDirectory = strings.TrimSpace(c.Destination.TargetDirectory)
@@ -104,13 +117,14 @@ func (c *CertificateConfig) Validate(checkPaths bool) error {
 	if !filepath.IsAbs(c.Destination.TargetDirectory) {
 		return fmt.Errorf("target directory must be an absolute path")
 	}
-	if checkPaths {
-		if info, err := os.Stat(c.Destination.TargetDirectory); err != nil {
-			return fmt.Errorf("target directory is not accessible: %w", err)
-		} else if !info.IsDir() {
-			return fmt.Errorf("target directory is not a directory")
-		}
+	if filepath.Clean(c.Destination.TargetDirectory) != c.Destination.TargetDirectory {
+		return fmt.Errorf("target directory must be normalized")
 	}
+	resolvedDestination, err := policy.ResolveDestination(c.Destination.TargetDirectory, checkPaths)
+	if err != nil {
+		return fmt.Errorf("target directory: %w", err)
+	}
+	c.Destination.TargetDirectory = resolvedDestination
 
 	c.Destination.TargetName = strings.TrimSpace(c.Destination.TargetName)
 	if c.Destination.TargetName == "" {
@@ -130,8 +144,7 @@ func (c *CertificateConfig) Validate(checkPaths bool) error {
 	return nil
 }
 
-func validatePath(path, label string, checkExists, mustBeDir bool) error {
-	path = strings.TrimSpace(path)
+func validatePath(path, label string) error {
 	if path == "" {
 		return fmt.Errorf("%s path is required", label)
 	}
@@ -142,26 +155,20 @@ func validatePath(path, label string, checkExists, mustBeDir bool) error {
 	if clean != path {
 		return fmt.Errorf("%s path must be normalized", label)
 	}
-	if checkExists {
-		info, err := os.Stat(path)
-		if err != nil {
-			return fmt.Errorf("%s path is not accessible: %w", label, err)
-		}
-		if mustBeDir && !info.IsDir() {
-			return fmt.Errorf("%s path is not a directory", label)
-		}
-	}
 	return nil
 }
 
-// Validate checks the whole configuration.
-func (cfg *Config) Validate(checkPaths bool) error {
+// Validate checks the whole configuration against the path policy.
+func (cfg *Config) Validate(checkPaths bool, policy *PathPolicy) error {
+	if policy == nil {
+		return fmt.Errorf("path policy is required")
+	}
 	if len(cfg.Certificates) == 0 {
 		return fmt.Errorf("at least one certificate must be configured")
 	}
 	seen := map[string]bool{}
 	for i := range cfg.Certificates {
-		if err := cfg.Certificates[i].Validate(checkPaths); err != nil {
+		if err := cfg.Certificates[i].Validate(checkPaths, policy); err != nil {
 			return fmt.Errorf("certificate %d (%s): %w", i, cfg.Certificates[i].Name, err)
 		}
 		if seen[cfg.Certificates[i].Name] {
@@ -174,9 +181,12 @@ func (cfg *Config) Validate(checkPaths bool) error {
 
 // Load reads configuration from a JSON file. If the file does not exist, it
 // returns the default configuration.
-func Load(path string) (*Config, error) {
+func Load(path string, policy *PathPolicy) (*Config, error) {
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		cfg := DefaultConfig()
+		if err := cfg.Validate(false, policy); err != nil {
+			return nil, fmt.Errorf("default config is invalid: %w", err)
+		}
 		return cfg, nil
 	}
 	data, err := os.ReadFile(path)
@@ -190,24 +200,43 @@ func Load(path string) (*Config, error) {
 	if cfg.LogLevel == "" {
 		cfg.LogLevel = "info"
 	}
+	if err := cfg.Validate(false, policy); err != nil {
+		return nil, fmt.Errorf("config validation failed: %w", err)
+	}
 	return cfg, nil
 }
 
 // Save writes configuration to a JSON file atomically.
-func (cfg *Config) Save(path string) error {
-	if err := cfg.Validate(false); err != nil {
+func (cfg *Config) Save(path string, policy *PathPolicy) error {
+	if err := cfg.Validate(false, policy); err != nil {
 		return err
 	}
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return fmt.Errorf("failed to marshal config: %w", err)
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0600); err != nil {
+	tmpFile, err := os.CreateTemp(filepath.Dir(path), ".config-*.json.tmp")
+	if err != nil {
 		return fmt.Errorf("failed to write config temp file: %w", err)
 	}
+	tmp := tmpFile.Name()
+	defer os.Remove(tmp)
+	if err := tmpFile.Chmod(0600); err != nil {
+		tmpFile.Close()
+		return fmt.Errorf("failed to secure config temp file: %w", err)
+	}
+	if _, err := tmpFile.Write(data); err != nil {
+		tmpFile.Close()
+		return fmt.Errorf("failed to write config temp file: %w", err)
+	}
+	if err := tmpFile.Sync(); err != nil {
+		tmpFile.Close()
+		return fmt.Errorf("failed to sync config temp file: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		return fmt.Errorf("failed to close config temp file: %w", err)
+	}
 	if err := os.Rename(tmp, path); err != nil {
-		os.Remove(tmp)
 		return fmt.Errorf("failed to rename config file: %w", err)
 	}
 	return nil

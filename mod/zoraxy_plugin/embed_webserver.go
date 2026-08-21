@@ -3,6 +3,7 @@ package zoraxy_plugin
 import (
 	"embed"
 	"fmt"
+	"html"
 	"io/fs"
 	"net/http"
 	"net/url"
@@ -42,10 +43,7 @@ func NewPluginEmbedUIRouter(pluginID string, targetFs *embed.FS, targetFsPrefix 
 }
 
 func (p *PluginUiRouter) populateCSRFToken(r *http.Request, fsHandler http.Handler) http.Handler {
-	csrfToken := r.Header.Get("X-Zoraxy-Csrf")
-	if csrfToken == "" {
-		csrfToken = "missing-csrf-token"
-	}
+	csrfToken := escapeCSRFToken(r.Header.Get("X-Zoraxy-Csrf"))
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, ".html") {
@@ -77,6 +75,13 @@ func (p *PluginUiRouter) populateCSRFToken(r *http.Request, fsHandler http.Handl
 		}
 		fsHandler.ServeHTTP(w, r)
 	})
+}
+
+func escapeCSRFToken(token string) string {
+	if token == "" {
+		token = "missing-csrf-token"
+	}
+	return html.EscapeString(token)
 }
 
 // Handler returns the http.Handler for the plugin UI.

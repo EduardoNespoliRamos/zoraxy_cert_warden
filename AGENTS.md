@@ -113,6 +113,11 @@ When changing the web UI or API, keep these constraints in mind:
 4. **Introspect spec must match the binary.** The `-introspect` flag prints the
    plugin metadata. Ensure `PermittedAPIEndpoints` and `UIPath` are correct.
 
+5. **Filesystem access is allowlisted.** Source and destination roots come from
+   `CERT_SYNC_ALLOWED_SOURCE_ROOTS` and
+   `CERT_SYNC_ALLOWED_DESTINATION_ROOTS`. Do not make these roots editable from
+   the web UI or bypass `config.PathPolicy` at filesystem boundaries.
+
 ## Coding conventions
 
 - Go 1.23. Keep code simple and explicit.
