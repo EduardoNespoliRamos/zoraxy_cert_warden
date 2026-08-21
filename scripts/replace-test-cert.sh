@@ -2,7 +2,7 @@
 set -euo pipefail
 
 DIR="${1:-./tmp/test-certs}"
-CN="${2:-*.homealone.com.br}"
+CN="${2:-example.com}"
 mkdir -p "$DIR"
 
 rm -f "$DIR/certchain0.pem" "$DIR/key0.pem"

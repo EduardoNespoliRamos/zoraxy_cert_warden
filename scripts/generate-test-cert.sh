@@ -2,7 +2,7 @@
 set -euo pipefail
 
 DIR="${1:-./tmp/test-certs}"
-CN="${2:-*.homealone.com.br}"
+CN="${2:-example.com}"
 mkdir -p "$DIR"
 
 openssl req -x509 -nodes -days 90 -newkey rsa:2048 \

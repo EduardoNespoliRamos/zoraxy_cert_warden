@@ -19,6 +19,7 @@
             <div id="overview-content">
                 <p>Loading...</p>
             </div>
+            <p id="status-error" class="error-message hidden" role="alert"></p>
         </section>
 
         <section class="actions">
@@ -35,13 +36,17 @@
 
         <div id="modal" class="modal hidden">
             <div class="modal-content">
-                <span class="close">&times;</span>
+                <button type="button" class="close" aria-label="Close">&times;</button>
                 <h2 id="modal-title">Edit Certificate</h2>
                 <form id="cert-form">
                     <input type="hidden" id="cert-original-name">
                     <label>
                         Name
                         <input type="text" id="cert-name" required>
+                    </label>
+                    <label class="inline">
+                        <input type="checkbox" id="cert-enabled">
+                        Enabled
                     </label>
                     <label>
                         Source Certificate
@@ -76,7 +81,7 @@
                         Set as Zoraxy Fallback Certificate
                     </label>
                     <div class="form-actions">
-                        <button type="submit" class="btn btn-primary">Save</button>
+                        <button type="submit" id="btn-save" class="btn btn-primary">Save</button>
                         <button type="button" id="btn-validate" class="btn">Validate</button>
                         <button type="button" id="btn-sync-now" class="btn">Sync Now</button>
                         <button type="button" id="btn-delete" class="btn btn-danger">Delete</button>

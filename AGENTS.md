@@ -6,7 +6,8 @@ Agent-focused guidance for the **Zoraxy Cert Warden Sync** plugin.
 
 This is a Zoraxy plugin (ID `com.eduardoramos.zoraxy.certwarden`) that
 synchronizes TLS certificates produced by the Cert Warden Client into Zoraxy's
-certificate store. It is written in Go 1.23 and distributed under AGPLv3.
+certificate store. It uses the Go 1.23 language/module baseline and a patched
+Go 1.25 build toolchain, and is distributed under AGPLv3.
 
 Key facts:
 
@@ -28,7 +29,7 @@ internal/
   certutil/             # Certificate parsing, validation, fingerprinting
   config/               # Config model, validation, persistence
   status/               # In-memory status aggregation
-  sync/                 # Atomic certificate writes, fallback.json
+  sync/                 # Transactional pair replacement, fallback.json
   watcher/              # fsnotify + polling watcher with debounce
   web/                  # HTTP handlers for the plugin UI API
 mod/zoraxy_plugin/      # Zoraxy plugin SDK (vendored minimal module)
@@ -72,7 +73,7 @@ Cert Warden Client writes PEM files
     internal/watcher (fsnotify + poll)
               |
               v
-    internal/sync (validate, atomic write)
+    internal/sync (validate, transactional pair replacement)
               |
               v
     Zoraxy certificate store (/opt/zoraxy/config/conf/certs)
@@ -81,19 +82,22 @@ Cert Warden Client writes PEM files
 - **Watcher**: monitors source certificate/key files. Uses `fsnotify` with a
   polling fallback. Debounces rapid changes so certificate + key updates are
   treated as one event.
-- **Syncer**: validates the certificate chain, checks private key correspondence,
-  compares SHA-256 fingerprints, and writes atomically (`.tmp` + rename). Sets
-  file modes `0600` for keys and `0644` for certificates.
-- **Status**: keeps an in-memory state per certificate (Healthy/Error/Unknown)
-  with last sync times, fingerprints, and messages.
+- **Syncer**: validates the presented certificate chain and unencrypted private
+  key, then compares a SHA-256 bundle digest covering the ordered chain and
+  public key. It stages both files and replaces them transactionally with
+  backups and rollback; the two-file replacement is not filesystem-atomic as a
+  unit. Keys use `0600` and certificates use `0644`.
+- **Status**: independently tracks source validation, destination validation,
+  synchronization, and watcher errors. Entries are Healthy, Error, Unknown, or
+  Disabled; disabled entries remain visible but do not degrade aggregate health.
 - **Web server**: serves the embedded UI and exposes a JSON API.
 
 ## Zoraxy plugin constraints
 
 When changing the web UI or API, keep these constraints in mind:
 
-1. **UI proxy only forwards the declared `ui_path`.** Zoraxy proxies requests
-   under `/plugin.ui/<id>/ui/*` to the plugin's declared `ui_path`. API endpoints
+1. **UI proxy only forwards the declared `ui_path`.** Zoraxy exposes requests
+   under `/plugin.ui/<id>/*` and forwards them to the plugin's `/ui/*` path. API endpoints
    must therefore also be registered under the same UI path prefix so the
    browser can reach them. See `cmd/cert-sync/main.go` and
    `internal/web/server.go`.
@@ -106,12 +110,13 @@ When changing the web UI or API, keep these constraints in mind:
    attaches the header. Do not remove the placeholder.
 
 3. **Fallback certificates require Zoraxy restart.** Zoraxy only reads
-   `fallback.json` at startup. The plugin writes the file, but the UI must warn
-   the user that a restart is needed. There is no plugin API to reload fallback
-   certificates at runtime.
+   `fallback.json` at startup. A changed file creates a persistent pending state;
+   after restarting Zoraxy, the operator acknowledges the warning in the UI.
+   Acknowledgement does not restart or reload Zoraxy.
 
-4. **Introspect spec must match the binary.** The `-introspect` flag prints the
-   plugin metadata. Ensure `PermittedAPIEndpoints` and `UIPath` are correct.
+4. **Inbound and outbound routes are distinct.** `UIPath` controls inbound UI
+   and plugin API proxying. `PermittedAPIEndpoints` only allowlists outbound
+   calls from the plugin to Zoraxy APIs; this plugin currently declares none.
 
 5. **Filesystem access is allowlisted.** Source and destination roots come from
    `CERT_SYNC_ALLOWED_SOURCE_ROOTS` and

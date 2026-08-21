@@ -13,9 +13,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check source branch prefix
+        env:
+          TARGET_BRANCH: ${{ github.base_ref }}
+          SOURCE_BRANCH: ${{ github.head_ref }}
         run: |
-          TARGET="${{ github.base_ref }}"
-          BRANCH="${{ github.head_ref }}"
+          TARGET="$TARGET_BRANCH"
+          BRANCH="$SOURCE_BRANCH"
 
           if [[ "$TARGET" == "main" ]]; then
             if [[ "$BRANCH" =~ ^(release|hotfix)/[0-9]+\.[0-9]+\.[0-9]+$ ]]; then

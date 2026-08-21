@@ -1,8 +1,10 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -14,6 +16,8 @@ const (
 	DefaultSourcePrivateKey  = "/cert_warden_plugin/key0.pem"
 	DefaultTargetDirectory   = "/opt/zoraxy/config/conf/certs"
 	DefaultPollInterval      = 10
+	MinPollIntervalSeconds   = 1
+	MaxPollIntervalSeconds   = 86400
 )
 
 // CertificateSource holds paths to the source certificate files.
@@ -57,7 +61,7 @@ func DefaultConfig() *Config {
 		LogLevel: "info",
 		Certificates: []CertificateConfig{
 			{
-				Name:    "homealone-wildcard",
+				Name:    "example-certificate",
 				Enabled: true,
 				Source: CertificateSource{
 					Certificate: DefaultSourceCertificate,
@@ -65,7 +69,7 @@ func DefaultConfig() *Config {
 				},
 				Destination: CertificateDestination{
 					TargetDirectory: DefaultTargetDirectory,
-					TargetName:      "homealone-wildcard",
+					TargetName:      "example-certificate",
 				},
 				Sync: SyncConfig{
 					AutoSync:            true,
@@ -80,68 +84,90 @@ func DefaultConfig() *Config {
 
 var validNameRegex = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
 
-// Validate checks a single certificate configuration against the path policy.
-func (c *CertificateConfig) Validate(checkPaths bool, policy *PathPolicy) error {
-	if policy == nil {
-		return fmt.Errorf("path policy is required")
+// Normalize trims user-provided values and applies defaults.
+func (c *CertificateConfig) Normalize() {
+	if c == nil {
+		return
 	}
 	c.Name = strings.TrimSpace(c.Name)
+	c.Source.Certificate = strings.TrimSpace(c.Source.Certificate)
+	c.Source.PrivateKey = strings.TrimSpace(c.Source.PrivateKey)
+	c.Destination.TargetDirectory = strings.TrimSpace(c.Destination.TargetDirectory)
+	c.Destination.TargetName = strings.TrimSpace(c.Destination.TargetName)
+	if c.Sync.PollIntervalSeconds == 0 {
+		c.Sync.PollIntervalSeconds = DefaultPollInterval
+	}
+}
+
+// Validate checks a single certificate configuration against the path policy.
+func (c *CertificateConfig) Validate(checkPaths bool, policy *PathPolicy) error {
+	if c == nil {
+		return fmt.Errorf("certificate configuration is required")
+	}
+	normalized := *c
+	normalized.Normalize()
+	_, err := normalized.validate(checkPaths, policy)
+	return err
+}
+
+func (c *CertificateConfig) validate(checkPaths bool, policy *PathPolicy) (string, error) {
+	if c == nil {
+		return "", fmt.Errorf("certificate configuration is required")
+	}
+	if policy == nil {
+		return "", fmt.Errorf("path policy is required")
+	}
 	if c.Name == "" {
-		return fmt.Errorf("certificate name is required")
+		return "", fmt.Errorf("certificate name is required")
 	}
 	if !validNameRegex.MatchString(c.Name) {
-		return fmt.Errorf("certificate name contains invalid characters")
+		return "", fmt.Errorf("certificate name contains invalid characters")
 	}
 
-	c.Source.Certificate = strings.TrimSpace(c.Source.Certificate)
 	if err := validatePath(c.Source.Certificate, "source certificate"); err != nil {
-		return err
+		return "", err
 	}
 	_, err := policy.ResolveSource(c.Source.Certificate, checkPaths)
 	if err != nil {
-		return fmt.Errorf("source certificate: %w", err)
+		return "", fmt.Errorf("source certificate: %w", err)
 	}
-	c.Source.PrivateKey = strings.TrimSpace(c.Source.PrivateKey)
 	if err := validatePath(c.Source.PrivateKey, "source private key"); err != nil {
-		return err
+		return "", err
 	}
 	_, err = policy.ResolveSource(c.Source.PrivateKey, checkPaths)
 	if err != nil {
-		return fmt.Errorf("source private key: %w", err)
+		return "", fmt.Errorf("source private key: %w", err)
 	}
 
-	c.Destination.TargetDirectory = strings.TrimSpace(c.Destination.TargetDirectory)
 	if c.Destination.TargetDirectory == "" {
-		return fmt.Errorf("target directory is required")
+		return "", fmt.Errorf("target directory is required")
 	}
 	if !filepath.IsAbs(c.Destination.TargetDirectory) {
-		return fmt.Errorf("target directory must be an absolute path")
+		return "", fmt.Errorf("target directory must be an absolute path")
 	}
 	if filepath.Clean(c.Destination.TargetDirectory) != c.Destination.TargetDirectory {
-		return fmt.Errorf("target directory must be normalized")
+		return "", fmt.Errorf("target directory must be normalized")
 	}
 	resolvedDestination, err := policy.ResolveDestination(c.Destination.TargetDirectory, checkPaths)
 	if err != nil {
-		return fmt.Errorf("target directory: %w", err)
+		return "", fmt.Errorf("target directory: %w", err)
 	}
-	c.Destination.TargetDirectory = resolvedDestination
 
-	c.Destination.TargetName = strings.TrimSpace(c.Destination.TargetName)
 	if c.Destination.TargetName == "" {
-		return fmt.Errorf("target name is required")
+		return "", fmt.Errorf("target name is required")
 	}
 	if !validNameRegex.MatchString(c.Destination.TargetName) {
-		return fmt.Errorf("target name contains invalid characters")
+		return "", fmt.Errorf("target name contains invalid characters")
 	}
 	if c.Destination.TargetName != filepath.Base(c.Destination.TargetName) {
-		return fmt.Errorf("target name must be a basename")
+		return "", fmt.Errorf("target name must be a basename")
 	}
 
-	if c.Sync.PollIntervalSeconds < 1 {
-		c.Sync.PollIntervalSeconds = DefaultPollInterval
+	if c.Sync.PollIntervalSeconds < MinPollIntervalSeconds || c.Sync.PollIntervalSeconds > MaxPollIntervalSeconds {
+		return "", fmt.Errorf("poll interval must be between %d and %d seconds", MinPollIntervalSeconds, MaxPollIntervalSeconds)
 	}
 
-	return nil
+	return resolvedDestination, nil
 }
 
 func validatePath(path, label string) error {
@@ -160,23 +186,80 @@ func validatePath(path, label string) error {
 
 // Validate checks the whole configuration against the path policy.
 func (cfg *Config) Validate(checkPaths bool, policy *PathPolicy) error {
+	if cfg == nil {
+		return fmt.Errorf("configuration is required")
+	}
+	normalized := cfg.Clone()
+	normalized.Normalize()
+	return normalized.validate(checkPaths, policy)
+}
+
+func (cfg *Config) validate(checkPaths bool, policy *PathPolicy) error {
 	if policy == nil {
 		return fmt.Errorf("path policy is required")
 	}
-	if len(cfg.Certificates) == 0 {
-		return fmt.Errorf("at least one certificate must be configured")
+	switch cfg.LogLevel {
+	case "debug", "info", "warn", "error":
+	default:
+		return fmt.Errorf("unsupported log level: %q", cfg.LogLevel)
 	}
-	seen := map[string]bool{}
+	seenNames := make(map[string]bool, len(cfg.Certificates))
+	type destinationKey struct {
+		directory string
+		name      string
+	}
+	seenDestinations := make(map[destinationKey]bool, len(cfg.Certificates))
+	fallbackDirectories := make(map[string]bool)
 	for i := range cfg.Certificates {
-		if err := cfg.Certificates[i].Validate(checkPaths, policy); err != nil {
+		cert := &cfg.Certificates[i]
+		resolvedDestination, err := cert.validate(checkPaths, policy)
+		if err != nil {
 			return fmt.Errorf("certificate %d (%s): %w", i, cfg.Certificates[i].Name, err)
 		}
-		if seen[cfg.Certificates[i].Name] {
-			return fmt.Errorf("duplicate certificate name: %s", cfg.Certificates[i].Name)
+		if seenNames[cert.Name] {
+			return fmt.Errorf("duplicate certificate name: %s", cert.Name)
 		}
-		seen[cfg.Certificates[i].Name] = true
+		seenNames[cert.Name] = true
+
+		destination := destinationKey{directory: resolvedDestination, name: cert.Destination.TargetName}
+		if seenDestinations[destination] {
+			return fmt.Errorf("duplicate destination: %s/%s", resolvedDestination, cert.Destination.TargetName)
+		}
+		seenDestinations[destination] = true
+		if cert.Fallback {
+			if fallbackDirectories[resolvedDestination] {
+				return fmt.Errorf("multiple fallback certificates for destination directory: %s", resolvedDestination)
+			}
+			fallbackDirectories[resolvedDestination] = true
+		}
 	}
 	return nil
+}
+
+// Normalize trims user-provided values and applies defaults.
+func (cfg *Config) Normalize() {
+	if cfg == nil {
+		return
+	}
+	cfg.LogLevel = strings.ToLower(strings.TrimSpace(cfg.LogLevel))
+	if cfg.LogLevel == "" {
+		cfg.LogLevel = "info"
+	}
+	for i := range cfg.Certificates {
+		cfg.Certificates[i].Normalize()
+	}
+}
+
+// Clone returns a deep copy of the configuration.
+func (cfg *Config) Clone() *Config {
+	if cfg == nil {
+		return nil
+	}
+	clone := *cfg
+	if cfg.Certificates != nil {
+		clone.Certificates = append([]CertificateConfig(nil), cfg.Certificates...)
+	}
+	return &clone
 }
 
 // Load reads configuration from a JSON file. If the file does not exist, it
@@ -194,50 +277,26 @@ func Load(path string, policy *PathPolicy) (*Config, error) {
 		return nil, fmt.Errorf("failed to read config: %w", err)
 	}
 	cfg := &Config{}
-	if err := json.Unmarshal(data, cfg); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(cfg); err != nil {
 		return nil, fmt.Errorf("failed to parse config: %w", err)
 	}
-	if cfg.LogLevel == "" {
-		cfg.LogLevel = "info"
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return nil, fmt.Errorf("failed to parse config: trailing JSON value")
+		}
+		return nil, fmt.Errorf("failed to parse config: %w", err)
 	}
+	cfg.Normalize()
 	if err := cfg.Validate(false, policy); err != nil {
 		return nil, fmt.Errorf("config validation failed: %w", err)
 	}
 	return cfg, nil
 }
 
-// Save writes configuration to a JSON file atomically.
+// Save writes configuration durably without modifying the receiver.
 func (cfg *Config) Save(path string, policy *PathPolicy) error {
-	if err := cfg.Validate(false, policy); err != nil {
-		return err
-	}
-	data, err := json.MarshalIndent(cfg, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to marshal config: %w", err)
-	}
-	tmpFile, err := os.CreateTemp(filepath.Dir(path), ".config-*.json.tmp")
-	if err != nil {
-		return fmt.Errorf("failed to write config temp file: %w", err)
-	}
-	tmp := tmpFile.Name()
-	defer os.Remove(tmp)
-	if err := tmpFile.Chmod(0600); err != nil {
-		tmpFile.Close()
-		return fmt.Errorf("failed to secure config temp file: %w", err)
-	}
-	if _, err := tmpFile.Write(data); err != nil {
-		tmpFile.Close()
-		return fmt.Errorf("failed to write config temp file: %w", err)
-	}
-	if err := tmpFile.Sync(); err != nil {
-		tmpFile.Close()
-		return fmt.Errorf("failed to sync config temp file: %w", err)
-	}
-	if err := tmpFile.Close(); err != nil {
-		return fmt.Errorf("failed to close config temp file: %w", err)
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		return fmt.Errorf("failed to rename config file: %w", err)
-	}
-	return nil
+	return NewStore(nil).Save(cfg, path, policy)
 }

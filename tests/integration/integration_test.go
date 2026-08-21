@@ -18,14 +18,14 @@ func TestSyncFlow_CertificateAThenB(t *testing.T) {
 	policy := integrationPolicy(t, sourceDir, targetDir)
 
 	// Generate and write certificate A.
-	certA, keyA, err := certutil.GenerateTestCertificateNow("a.homealone.com.br", time.Hour*24)
+	certA, keyA, err := certutil.GenerateTestCertificateNow("a.example.com", time.Hour*24)
 	if err != nil {
 		t.Fatalf("generate cert A failed: %v", err)
 	}
 	writeSource(t, sourceDir, certA, keyA)
 
 	cfg := config.CertificateConfig{
-		Name:    "homealone-wildcard",
+		Name:    "example-certificate",
 		Enabled: true,
 		Source: config.CertificateSource{
 			Certificate: filepath.Join(sourceDir, "certchain0.pem"),
@@ -33,7 +33,7 @@ func TestSyncFlow_CertificateAThenB(t *testing.T) {
 		},
 		Destination: config.CertificateDestination{
 			TargetDirectory: targetDir,
-			TargetName:      "homealone-wildcard",
+			TargetName:      "example-certificate",
 		},
 	}
 
@@ -45,7 +45,7 @@ func TestSyncFlow_CertificateAThenB(t *testing.T) {
 		t.Fatal("expected sync A to write files")
 	}
 
-	destFP, err := sync.ReadDestinationFingerprint(targetDir, "homealone-wildcard", policy)
+	destFP, err := sync.ReadDestinationFingerprint(targetDir, "example-certificate", policy)
 	if err != nil {
 		t.Fatalf("read dest fingerprint failed: %v", err)
 	}
@@ -54,7 +54,7 @@ func TestSyncFlow_CertificateAThenB(t *testing.T) {
 	}
 
 	// Replace with certificate B and use watcher to detect the change.
-	certB, keyB, err := certutil.GenerateTestCertificateNow("b.homealone.com.br", time.Hour*24)
+	certB, keyB, err := certutil.GenerateTestCertificateNow("b.example.com", time.Hour*24)
 	if err != nil {
 		t.Fatalf("generate cert B failed: %v", err)
 	}
@@ -89,7 +89,7 @@ func TestSyncFlow_CertificateAThenB(t *testing.T) {
 		t.Fatal("timeout waiting for watcher to sync certificate B")
 	}
 
-	destFP2, err := sync.ReadDestinationFingerprint(targetDir, "homealone-wildcard", policy)
+	destFP2, err := sync.ReadDestinationFingerprint(targetDir, "example-certificate", policy)
 	if err != nil {
 		t.Fatalf("read dest fingerprint failed: %v", err)
 	}
@@ -103,11 +103,11 @@ func TestSyncFlow_SplitUpdate(t *testing.T) {
 	targetDir := t.TempDir()
 	policy := integrationPolicy(t, sourceDir, targetDir)
 
-	certA, keyA, err := certutil.GenerateTestCertificateNow("split.homealone.com.br", time.Hour*24)
+	certA, keyA, err := certutil.GenerateTestCertificateNow("split.example.com", time.Hour*24)
 	if err != nil {
 		t.Fatalf("generate cert A failed: %v", err)
 	}
-	certB, keyB, err := certutil.GenerateTestCertificateNow("split.homealone.com.br", time.Hour*24)
+	certB, keyB, err := certutil.GenerateTestCertificateNow("split.example.com", time.Hour*24)
 	if err != nil {
 		t.Fatalf("generate cert B failed: %v", err)
 	}

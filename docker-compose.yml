@@ -11,10 +11,10 @@ services:
       - CERT_SYNC_ALLOWED_SOURCE_ROOTS=/cert_warden_plugin
       - CERT_SYNC_ALLOWED_DESTINATION_ROOTS=/opt/zoraxy/config/conf/certs
     volumes:
-      - /mnt/raid/docker-compose/zoraxy/config:/opt/zoraxy/config
-      - /mnt/raid/docker-compose/zoraxy/plugin:/opt/zoraxy/plugin
+      - /path/to/zoraxy/config:/opt/zoraxy/config
+      - /path/to/zoraxy/plugin:/opt/zoraxy/plugin
       # Cert Warden Client output
-      - /mnt/raid/docker-compose/zoraxy/certs:/cert_warden_plugin:ro
+      - /path/to/cert-warden/output:/cert_warden_plugin:ro
 
   # Optional: build and place the plugin binary into the plugin volume.
   # In production, copy the built binary manually or via CI/CD.

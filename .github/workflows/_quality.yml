@@ -1,0 +1,100 @@
+name: Quality Gates
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Git ref to test
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  formatting:
+    name: Formatting
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - run: DOCKER=docker make fmt-check
+
+  unit:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - run: DOCKER=docker make test
+
+  race:
+    name: Race detector
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - run: DOCKER=docker make race
+
+  vet:
+    name: Go vet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - run: DOCKER=docker make vet
+
+  analyzers:
+    name: Static analysis
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - run: DOCKER=docker make staticcheck
+      - run: DOCKER=docker make govulncheck
+
+  repeated:
+    name: Repeated watcher and sync tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - run: DOCKER=docker make repeat-test
+
+  integration:
+    name: Filesystem integration tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - run: DOCKER=docker make integration-test
+
+  build:
+    name: Build amd64 and arm64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - run: DOCKER=docker make build-all
+
+  aggregate:
+    name: Quality gates
+    if: always()
+    runs-on: ubuntu-latest
+    needs: [formatting, unit, race, vet, analyzers, repeated, integration, build]
+    steps:
+      - name: Require every quality gate
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          for result in $RESULTS; do
+            test "$result" = "success"
+          done

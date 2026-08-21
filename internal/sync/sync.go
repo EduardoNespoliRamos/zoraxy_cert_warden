@@ -2,9 +2,13 @@ package sync
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
+	stdsync "sync"
 
 	"github.com/eduardoramos/zoraxy-cert-warden/internal/certutil"
 	"github.com/eduardoramos/zoraxy-cert-warden/internal/config"
@@ -18,15 +22,55 @@ const (
 
 // Result describes the outcome of a sync attempt.
 type Result struct {
-	Synced    bool
-	NoChanges bool
-	SourceFP  string
-	DestFP    string
-	Fallback  bool
-	Error     error
+	Synced             bool
+	NoChanges          bool
+	SourceFP           string
+	DestFP             string
+	SourceBundleDigest string
+	DestBundleDigest   string
+	Fallback           bool
+	FallbackChanged    bool
+	Error              error
 }
 
-// Sync performs a validated atomic sync from source to destination.
+type syncFile interface {
+	Write([]byte) (int, error)
+	Sync() error
+	Chmod(os.FileMode) error
+	Close() error
+	Name() string
+}
+
+type filesystem struct {
+	lstat      func(string) (os.FileInfo, error)
+	readFile   func(string) ([]byte, error)
+	mkdirAll   func(string, os.FileMode) error
+	createTemp func(string, string) (syncFile, error)
+	rename     func(string, string) error
+	remove     func(string) error
+	readDir    func(string) ([]os.DirEntry, error)
+	syncDir    func(string) error
+}
+
+var osFilesystem = filesystem{
+	lstat: os.Lstat, readFile: os.ReadFile, mkdirAll: os.MkdirAll,
+	createTemp: func(dir, pattern string) (syncFile, error) { return os.CreateTemp(dir, pattern) },
+	rename:     os.Rename, remove: os.Remove, readDir: os.ReadDir,
+	syncDir: func(path string) error {
+		dir, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer dir.Close()
+		return dir.Sync()
+	},
+}
+
+// Replacements are serialized per canonical destination while unrelated
+// certificate targets remain independent.
+var replacementLocks stdsync.Map
+
+// Sync performs a validated sync from source to destination.
 func Sync(cfg config.CertificateConfig, policy *config.PathPolicy) (*certutil.CertInfo, *Result, error) {
 	res := &Result{}
 	if err := cfg.Validate(false, policy); err != nil {
@@ -60,102 +104,262 @@ func Sync(cfg config.CertificateConfig, policy *config.PathPolicy) (*certutil.Ce
 		return nil, res, err
 	}
 	res.SourceFP = certInfo.Fingerprint
+	res.SourceBundleDigest = certInfo.BundleDigest
 
 	destDir := cfg.Destination.TargetDirectory
 	destName := cfg.Destination.TargetName
-
-	destFP, err := ReadDestinationFingerprint(destDir, destName, policy)
-	if err == nil {
-		res.DestFP = destFP
-	}
-
-	if certutil.IsSameFingerprint(certInfo.Fingerprint, destFP) {
-		res.NoChanges = true
-		if cfg.Fallback {
-			if err := WriteFallback(destDir, destName, policy); err != nil {
-				res.Error = err
-				return certInfo, res, err
+	destInfo, destErr := readDestinationPair(destDir, destName, policy, osFilesystem)
+	if destErr == nil {
+		res.DestFP = destInfo.Fingerprint
+		res.DestBundleDigest = destInfo.BundleDigest
+		if destInfo.BundleDigest == certInfo.BundleDigest {
+			res.NoChanges = true
+			if cfg.Fallback {
+				changed, err := EnsureFallback(destDir, &destName, policy)
+				res.FallbackChanged = changed
+				if err != nil {
+					res.Error = err
+					return certInfo, res, err
+				}
+				res.Fallback = true
 			}
-			res.Fallback = true
+			return certInfo, res, nil
 		}
-		return certInfo, res, nil
 	}
 
-	if err := AtomicWrite(destDir, destName, certPEM, keyPEM, policy); err != nil {
+	if err := replacePair(destDir, destName, certPEM, keyPEM, certInfo.BundleDigest, policy, osFilesystem); err != nil {
 		res.Error = err
 		return certInfo, res, err
 	}
 	res.Synced = true
+	res.DestFP = certInfo.Fingerprint
+	res.DestBundleDigest = certInfo.BundleDigest
 
 	if cfg.Fallback {
-		if err := WriteFallback(destDir, destName, policy); err != nil {
+		changed, err := EnsureFallback(destDir, &destName, policy)
+		res.FallbackChanged = changed
+		if err != nil {
 			res.Error = err
 			return certInfo, res, err
 		}
 		res.Fallback = true
 	}
-
 	return certInfo, res, nil
 }
 
-// AtomicWrite writes certificate and key files atomically.
+// AtomicWrite is retained for callers of the original API. Pair replacement is
+// transactional with rollback, not atomic as a unit at the filesystem level.
 func AtomicWrite(destDir, destName string, certPEM, keyPEM []byte, policy *config.PathPolicy) error {
+	info, err := certutil.ValidatePEMPair(certPEM, keyPEM)
+	if err != nil {
+		return fmt.Errorf("invalid source certificate pair: %w", err)
+	}
+	return replacePair(destDir, destName, certPEM, keyPEM, info.BundleDigest, policy, osFilesystem)
+}
+
+type oldEntry struct {
+	path       string
+	backupPath string
+	existed    bool
+	backedUp   bool
+}
+
+func replacePair(destDir, destName string, certPEM, keyPEM []byte, expectedDigest string, policy *config.PathPolicy, fsys filesystem) error {
+	// Validation deliberately precedes directory creation and all staging writes.
+	info, err := certutil.ValidatePEMPair(certPEM, keyPEM)
+	if err != nil {
+		return fmt.Errorf("invalid source certificate pair: %w", err)
+	}
+	if expectedDigest == "" {
+		expectedDigest = info.BundleDigest
+	}
+
 	resolvedDir, err := policy.ResolveDestination(destDir, false)
 	if err != nil {
 		return err
 	}
-	destDir = resolvedDir
-	if err := os.MkdirAll(destDir, 0755); err != nil {
-		return fmt.Errorf("failed to create target directory: %w", err)
+	lockKey := filepath.Join(resolvedDir, destName)
+	lockValue, _ := replacementLocks.LoadOrStore(lockKey, &stdsync.Mutex{})
+	lock := lockValue.(*stdsync.Mutex)
+	lock.Lock()
+	defer lock.Unlock()
+	if err := fsys.mkdirAll(resolvedDir, 0755); err != nil {
+		return fmt.Errorf("create target directory: %w", err)
+	}
+	if err := cleanupStaging(resolvedDir, destName, fsys); err != nil {
+		return fmt.Errorf("clean stale staging files: %w", err)
 	}
 
-	pemPath := filepath.Join(destDir, destName+".pem")
-	keyPath := filepath.Join(destDir, destName+".key")
-
-	pemTmp, err := writeTempFile(destDir, "."+destName+"-*.pem.tmp", certPEM, publicCertFileMode)
+	certTmp, err := writeTempFileFS(resolvedDir, "."+destName+"-cert-sync-*.tmp", certPEM, publicCertFileMode, fsys)
 	if err != nil {
-		return fmt.Errorf("failed to write certificate temp file: %w", err)
+		return fmt.Errorf("stage certificate: %w", err)
 	}
-	keyTmp, err := writeTempFile(destDir, "."+destName+"-*.key.tmp", keyPEM, privateKeyFileMode)
+	keyTmp, err := writeTempFileFS(resolvedDir, "."+destName+"-key-sync-*.tmp", keyPEM, privateKeyFileMode, fsys)
 	if err != nil {
-		os.Remove(pemTmp)
-		return fmt.Errorf("failed to write private key temp file: %w", err)
+		_ = fsys.remove(certTmp)
+		return fmt.Errorf("stage private key: %w", err)
 	}
 
-	if err := os.Rename(keyTmp, keyPath); err != nil {
-		os.Remove(pemTmp)
-		os.Remove(keyTmp)
-		return fmt.Errorf("failed to rename private key file: %w", err)
+	certOld := oldEntry{path: filepath.Join(resolvedDir, destName+".pem")}
+	keyOld := oldEntry{path: filepath.Join(resolvedDir, destName+".key")}
+	cleanupPaths := []string{certTmp, keyTmp}
+	defer func() {
+		for _, path := range cleanupPaths {
+			_ = fsys.remove(path)
+		}
+	}()
+
+	if err := prepareBackup(&certOld, resolvedDir, "."+destName+"-cert-backup-*.tmp", fsys); err != nil {
+		return fmt.Errorf("prepare certificate backup: %w", err)
 	}
-	if err := os.Rename(pemTmp, pemPath); err != nil {
-		os.Remove(pemTmp)
-		return fmt.Errorf("failed to rename certificate file: %w", err)
+	if err := prepareBackup(&keyOld, resolvedDir, "."+destName+"-key-backup-*.tmp", fsys); err != nil {
+		return failWithRollback(fmt.Errorf("prepare private key backup: %w", err), resolvedDir, &certOld, &keyOld, fsys)
 	}
 
+	if err := fsys.rename(certTmp, certOld.path); err != nil {
+		return failWithRollback(fmt.Errorf("publish certificate: %w", err), resolvedDir, &certOld, &keyOld, fsys)
+	}
+	certTmp = ""
+	if err := fsys.rename(keyTmp, keyOld.path); err != nil {
+		return failWithRollback(fmt.Errorf("publish private key: %w", err), resolvedDir, &certOld, &keyOld, fsys)
+	}
+	keyTmp = ""
+
+	installed, err := readPairAt(certOld.path, keyOld.path, fsys)
+	if err == nil && installed.BundleDigest != expectedDigest {
+		err = fmt.Errorf("installed bundle digest mismatch: got %s, want %s", installed.BundleDigest, expectedDigest)
+	}
+	if err != nil {
+		return failWithRollback(fmt.Errorf("validate installed pair: %w", err), resolvedDir, &certOld, &keyOld, fsys)
+	}
+	if err := fsys.syncDir(resolvedDir); err != nil {
+		return failWithRollback(fmt.Errorf("sync target directory: %w", err), resolvedDir, &certOld, &keyOld, fsys)
+	}
+
+	for _, old := range []*oldEntry{&certOld, &keyOld} {
+		if old.backupPath != "" {
+			if err := fsys.remove(old.backupPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
+				return fmt.Errorf("installed pair is valid but backup cleanup failed: %w", err)
+			}
+			old.backupPath = ""
+		}
+	}
+	if err := fsys.syncDir(resolvedDir); err != nil {
+		return fmt.Errorf("installed pair is valid but final directory sync failed: %w", err)
+	}
 	return nil
 }
 
-func writeTempFile(dir, pattern string, data []byte, mode os.FileMode) (string, error) {
-	file, err := os.CreateTemp(dir, pattern)
+func prepareBackup(old *oldEntry, dir, pattern string, fsys filesystem) error {
+	_, err := fsys.lstat(old.path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	old.existed = true
+	marker, err := fsys.createTemp(dir, pattern)
+	if err != nil {
+		return err
+	}
+	old.backupPath = marker.Name()
+	if err := marker.Close(); err != nil {
+		_ = fsys.remove(old.backupPath)
+		old.backupPath = ""
+		return err
+	}
+	if err := fsys.remove(old.backupPath); err != nil {
+		old.backupPath = ""
+		return err
+	}
+	if err := fsys.rename(old.path, old.backupPath); err != nil {
+		old.backupPath = ""
+		return err
+	}
+	old.backedUp = true
+	return nil
+}
+
+func failWithRollback(original error, dir string, certOld, keyOld *oldEntry, fsys filesystem) error {
+	certState, certErr := restoreEntry(certOld, fsys)
+	keyState, keyErr := restoreEntry(keyOld, fsys)
+	dirErr := fsys.syncDir(dir)
+
+	var validationErr error
+	if certOld.existed && keyOld.existed && certErr == nil && keyErr == nil {
+		_, validationErr = readPairAt(certOld.path, keyOld.path, fsys)
+		if validationErr != nil {
+			validationErr = fmt.Errorf("restored pair validation: %w", validationErr)
+		}
+	}
+	rollbackErr := errors.Join(certErr, keyErr, validationErr, dirErr)
+	state := fmt.Sprintf("rollback states: certificate=%s, private key=%s", certState, keyState)
+	if rollbackErr != nil {
+		return errors.Join(original, fmt.Errorf("%s: %w", state, rollbackErr))
+	}
+	return fmt.Errorf("%w; %s", original, state)
+}
+
+func restoreEntry(old *oldEntry, fsys filesystem) (string, error) {
+	if old.existed {
+		if !old.backedUp {
+			return "unchanged", nil
+		}
+		if err := fsys.remove(old.path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return "unknown", fmt.Errorf("remove current %s: %w", old.path, err)
+		}
+		if err := fsys.rename(old.backupPath, old.path); err != nil {
+			return "unknown", fmt.Errorf("restore %s: %w", old.path, err)
+		}
+		old.backedUp = false
+		old.backupPath = ""
+		return "restored", nil
+	}
+	if err := fsys.remove(old.path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return "unknown", fmt.Errorf("restore absence of %s: %w", old.path, err)
+	}
+	return "absent", nil
+}
+
+func cleanupStaging(dir, destName string, fsys filesystem) error {
+	entries, err := fsys.readDir(dir)
+	if err != nil {
+		return err
+	}
+	prefixes := []string{"." + destName + "-cert-sync-", "." + destName + "-key-sync-"}
+	for _, entry := range entries {
+		for _, prefix := range prefixes {
+			if strings.HasPrefix(entry.Name(), prefix) && strings.HasSuffix(entry.Name(), ".tmp") {
+				if err := fsys.remove(filepath.Join(dir, entry.Name())); err != nil && !errors.Is(err, fs.ErrNotExist) {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func writeTempFileFS(dir, pattern string, data []byte, mode os.FileMode, fsys filesystem) (string, error) {
+	file, err := fsys.createTemp(dir, pattern)
 	if err != nil {
 		return "", err
 	}
 	path := file.Name()
 	ok := false
 	defer func() {
-		file.Close()
+		_ = file.Close()
 		if !ok {
-			os.Remove(path)
+			_ = fsys.remove(path)
 		}
 	}()
-
 	if _, err := file.Write(data); err != nil {
 		return "", err
 	}
-	if err := file.Sync(); err != nil {
+	if err := file.Chmod(mode); err != nil {
 		return "", err
 	}
-	if err := file.Chmod(mode); err != nil {
+	if err := file.Sync(); err != nil {
 		return "", err
 	}
 	if err := file.Close(); err != nil {
@@ -165,45 +369,124 @@ func writeTempFile(dir, pattern string, data []byte, mode os.FileMode) (string, 
 	return path, nil
 }
 
-// ReadDestinationFingerprint reads the fingerprint of the destination certificate.
-func ReadDestinationFingerprint(destDir, destName string, policy *config.PathPolicy) (string, error) {
+func readDestinationPair(destDir, destName string, policy *config.PathPolicy, fsys filesystem) (*certutil.CertInfo, error) {
 	resolvedDir, err := policy.ResolveDestination(destDir, false)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	destDir = resolvedDir
-	pemPath := filepath.Join(destDir, destName+".pem")
-	if err := rejectSymlink(pemPath); err != nil {
-		return "", err
-	}
-	data, err := os.ReadFile(pemPath)
-	if err != nil {
-		return "", err
-	}
-	return certutil.Fingerprint(data)
+	return readPairAt(filepath.Join(resolvedDir, destName+".pem"), filepath.Join(resolvedDir, destName+".key"), fsys)
 }
 
-// WriteFallback writes the fallback.json file used by Zoraxy.
-func WriteFallback(destDir, destName string, policy *config.PathPolicy) error {
+func readPairAt(certPath, keyPath string, fsys filesystem) (*certutil.CertInfo, error) {
+	certInfo, certStatErr := fsys.lstat(certPath)
+	keyInfo, keyStatErr := fsys.lstat(keyPath)
+	if err := errors.Join(wrapPathError("inspect certificate", certStatErr), wrapPathError("inspect private key", keyStatErr)); err != nil {
+		return nil, err
+	}
+	if certInfo.Mode()&os.ModeSymlink != 0 || keyInfo.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("destination certificate pair contains a symlink")
+	}
+	if !certInfo.Mode().IsRegular() || !keyInfo.Mode().IsRegular() {
+		return nil, fmt.Errorf("destination certificate pair must contain regular files")
+	}
+	certPEM, certReadErr := fsys.readFile(certPath)
+	keyPEM, keyReadErr := fsys.readFile(keyPath)
+	if err := errors.Join(wrapPathError("read certificate", certReadErr), wrapPathError("read private key", keyReadErr)); err != nil {
+		return nil, err
+	}
+	if certInfo.Mode().Perm() != publicCertFileMode || keyInfo.Mode().Perm() != privateKeyFileMode {
+		return nil, fmt.Errorf("destination modes are certificate=%04o private-key=%04o", certInfo.Mode().Perm(), keyInfo.Mode().Perm())
+	}
+	return certutil.ValidatePEMPair(certPEM, keyPEM)
+}
+
+func wrapPathError(operation string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%s: %w", operation, err)
+}
+
+// ReadDestinationFingerprint reads the validated destination pair's leaf fingerprint.
+func ReadDestinationFingerprint(destDir, destName string, policy *config.PathPolicy) (string, error) {
+	info, err := ReadDestinationInfo(destDir, destName, policy)
+	if err != nil {
+		return "", err
+	}
+	return info.Fingerprint, nil
+}
+
+// ReadDestinationInfo validates and describes the complete destination pair.
+func ReadDestinationInfo(destDir, destName string, policy *config.PathPolicy) (*certutil.CertInfo, error) {
+	return readDestinationPair(destDir, destName, policy, osFilesystem)
+}
+
+// EnsureFallback reconciles Zoraxy's fallback.json with the desired certificate.
+// A nil desired value removes the file. It reports whether durable state changed.
+func EnsureFallback(destDir string, desired *string, policy *config.PathPolicy) (bool, error) {
 	resolvedDir, err := policy.ResolveDestination(destDir, false)
 	if err != nil {
-		return err
+		return false, err
 	}
-	destDir = resolvedDir
-	if err := os.MkdirAll(destDir, 0755); err != nil {
-		return fmt.Errorf("failed to create target directory: %w", err)
+	path := filepath.Join(resolvedDir, "fallback.json")
+	lockValue, _ := replacementLocks.LoadOrStore(path, &stdsync.Mutex{})
+	lock := lockValue.(*stdsync.Mutex)
+	lock.Lock()
+	defer lock.Unlock()
+
+	info, statErr := os.Lstat(path)
+	if statErr != nil && !errors.Is(statErr, fs.ErrNotExist) {
+		return false, fmt.Errorf("inspect fallback file: %w", statErr)
 	}
-	data, err := json.Marshal(map[string]string{"fallbackCert": destName})
+	if statErr == nil && info.Mode()&os.ModeSymlink != 0 {
+		return false, fmt.Errorf("refusing to modify symlink: %s", path)
+	}
+
+	if desired == nil {
+		if errors.Is(statErr, fs.ErrNotExist) {
+			return false, nil
+		}
+		if err := os.Remove(path); err != nil {
+			return false, fmt.Errorf("remove fallback file: %w", err)
+		}
+		if err := osFilesystem.syncDir(resolvedDir); err != nil {
+			return true, fmt.Errorf("sync fallback directory: %w", err)
+		}
+		return true, nil
+	}
+	if *desired == "" || filepath.Base(*desired) != *desired {
+		return false, fmt.Errorf("fallback certificate name must be a non-empty basename")
+	}
+	if statErr == nil && info.Mode().IsRegular() && info.Mode().Perm() == fallbackFileMode {
+		data, readErr := os.ReadFile(path)
+		if readErr == nil {
+			var current struct {
+				FallbackCert string `json:"fallbackCert"`
+			}
+			if json.Unmarshal(data, &current) == nil && current.FallbackCert == *desired {
+				return false, nil
+			}
+		}
+	}
+	if err := os.MkdirAll(resolvedDir, 0755); err != nil {
+		return false, fmt.Errorf("failed to create target directory: %w", err)
+	}
+	data, err := json.Marshal(map[string]string{"fallbackCert": *desired})
 	if err != nil {
-		return err
+		return false, err
 	}
-	path := filepath.Join(destDir, "fallback.json")
-	tmp, err := writeTempFile(destDir, ".fallback-*.json.tmp", data, fallbackFileMode)
+	tmp, err := writeTempFileFS(resolvedDir, ".fallback-*.json.tmp", data, fallbackFileMode, osFilesystem)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer os.Remove(tmp)
-	return os.Rename(tmp, path)
+	if err := os.Rename(tmp, path); err != nil {
+		return false, err
+	}
+	if err := osFilesystem.syncDir(resolvedDir); err != nil {
+		return true, fmt.Errorf("sync fallback directory: %w", err)
+	}
+	return true, nil
 }
 
 // ReadFallback reads the currently configured fallback certificate name.
@@ -212,8 +495,7 @@ func ReadFallback(destDir string, policy *config.PathPolicy) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	destDir = resolvedDir
-	path := filepath.Join(destDir, "fallback.json")
+	path := filepath.Join(resolvedDir, "fallback.json")
 	if err := rejectSymlink(path); err != nil {
 		return "", err
 	}
