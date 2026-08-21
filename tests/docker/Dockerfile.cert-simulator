@@ -1,0 +1,5 @@
+FROM docker.io/alpine:latest
+RUN apk add --no-cache openssl
+COPY tests/docker/entrypoint.cert-simulator.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+ENTRYPOINT ["/entrypoint.sh"]

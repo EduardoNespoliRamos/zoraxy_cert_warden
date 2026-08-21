@@ -1,0 +1,61 @@
+services:
+  cert-simulator:
+    build:
+      context: ../..
+      dockerfile: tests/docker/Dockerfile.cert-simulator
+    environment:
+      CERT_DIR: /certs
+      CERT_CN: "*.homealone.com.br"
+    volumes:
+      - certs:/certs
+
+  plugin-build:
+    build:
+      context: ../..
+      dockerfile: tests/docker/Dockerfile.plugin
+    volumes:
+      - zoraxy-plugin:/opt/zoraxy/plugin
+    depends_on:
+      - cert-simulator
+
+  zoraxy:
+    image: zoraxydocker/zoraxy:${ZORAXY_VERSION:-v3.3.3}
+    environment:
+      - NOAUTH=true
+    volumes:
+      - zoraxy-config:/opt/zoraxy/config
+      - zoraxy-plugin:/opt/zoraxy/plugin
+      - certs:/cert_warden_plugin:ro
+    depends_on:
+      plugin-build:
+        condition: service_completed_successfully
+    ports:
+      - "8000:8000"
+
+  tests:
+    build:
+      context: ../..
+      dockerfile: tests/docker/Dockerfile.tests
+    environment:
+      ZORAXY_URL: http://zoraxy:8000
+      PLUGIN_ID: com.eduardoramos.zoraxy.certwarden
+    volumes:
+      - certs:/certs
+      - zoraxy-config:/opt/zoraxy/config
+      - zoraxy-plugin:/opt/zoraxy/plugin
+    depends_on:
+      - zoraxy
+
+  e2e:
+    build:
+      context: ../..
+      dockerfile: tests/docker/Dockerfile.e2e
+    environment:
+      ZORAXY_URL: http://zoraxy:8000
+    depends_on:
+      - zoraxy
+
+volumes:
+  certs:
+  zoraxy-config:
+  zoraxy-plugin:

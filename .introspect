@@ -1,0 +1,13 @@
+{
+  "id": "com.eduardoramos.zoraxy.certwarden",
+  "name": "Zoraxy Cert Warden Sync",
+  "author": "Eduardo Ramos",
+  "author_contact": "",
+  "description": "Synchronizes certificates from Cert Warden Client into Zoraxy TLS store.",
+  "url": "https://github.com/eduardoramos/zoraxy-cert-warden",
+  "type": 1,
+  "version_major": 1,
+  "version_minor": 0,
+  "version_patch": 0,
+  "ui_path": "/ui"
+}

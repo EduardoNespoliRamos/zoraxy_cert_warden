@@ -1,0 +1,21 @@
+name: PR Source Branch Validation
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  validate-source-branch:
+    name: Validate source branch
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check source branch prefix
+        run: |
+          BRANCH="${{ github.head_ref }}"
+          if [[ "$BRANCH" =~ ^(release|hotfix)/[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Source branch '$BRANCH' is allowed."
+            exit 0
+          fi
+          echo "ERROR: Pull requests to main must come from release/X.Y.Z or hotfix/X.Y.Z branches."
+          echo "Received: $BRANCH"
+          exit 1

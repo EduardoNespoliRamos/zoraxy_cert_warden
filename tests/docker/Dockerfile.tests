@@ -1,0 +1,6 @@
+FROM docker.io/golang:1.23-alpine
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+CMD ["go", "test", "-v", "./tests/integration/..."]
