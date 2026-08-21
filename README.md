@@ -216,32 +216,43 @@ Generate local test certificates:
 
 ## Release process
 
-This project follows a Git Flow-inspired release process:
+This project follows Git Flow:
 
-1. Create a release or hotfix branch from `main`:
+- `main` contains production-ready code.
+- `develop` is the integration branch for the next release.
+- `feature/*` and `bugfix/*` branches start from and merge back into `develop`.
+- `release/X.Y.Z` branches start from `develop` and merge into `main`.
+- `hotfix/X.Y.Z` branches start from `main` and merge into `main`.
 
-   ```bash
-   git checkout -b release/0.0.1
-   ```
+To develop a change:
 
-2. Make the necessary changes and push the branch.
+```bash
+git checkout develop
+git pull origin develop
+git checkout -b feature/my-change
+```
 
-3. Open a Pull Request from the release/hotfix branch to `main`.
-   Only branches matching `release/X.Y.Z` or `hotfix/X.Y.Z` are allowed.
+Open the Pull Request against `develop`. Use `bugfix/*` for non-urgent fixes
+that belong in the next release.
 
-4. After the PR is reviewed and merged, GitHub Actions automatically:
+To prepare a release:
 
-   - Validates the source branch name.
-   - Runs the full test suite (unit tests, E2E tests, and the integration
-     matrix).
-   - Creates a tag `vX.Y.Z` from the branch name.
-   - Triggers `release.yml` to build the binaries, generate `SHA256SUMS`, and
-     publish a GitHub Release.
+```bash
+git checkout develop
+git pull origin develop
+git checkout -b release/0.0.1
+```
 
-5. Attach release notes or a manual changelog if needed.
+Open the release Pull Request against `main`. After it is merged, GitHub Actions
+runs the full test suite, creates `vX.Y.Z`, builds both binaries, generates
+`SHA256SUMS`, and publishes the GitHub Release.
 
-Manual tags matching `v*.*.*` still trigger `release.yml` for backwards
-compatibility, but prefer the automated flow above.
+For an urgent production fix, create `hotfix/X.Y.Z` from `main` and open a Pull
+Request back to `main`. Release and hotfix merges must then be synchronized back
+into `develop` with a `main` to `develop` Pull Request.
+
+Manual tags matching `v*.*.*` remain supported, but the automated release and
+hotfix flows are preferred.
 
 ## CI / CD
 
@@ -249,9 +260,9 @@ This repository uses GitHub Actions. See `.github/workflows/`.
 
 - **CI** (`ci.yml`) — runs unit tests, E2E tests against Zoraxy `v3.3.3`, and
   builds `linux/amd64` and `linux/arm64` binaries on every PR and push to
-  `main`.
+  `main` and `develop`.
 - **Compatibility** (`compatibility.yml`) — runs integration tests against the
-  full Zoraxy version matrix on every PR and push to `main`.
+  full Zoraxy version matrix on every PR and push to `main` and `develop`.
 - **Release** (`release.yml`) — triggered by tags `v*.*.*`, creates a GitHub
   Release with the compiled binaries and `SHA256SUMS`.
 
