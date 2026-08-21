@@ -25,22 +25,67 @@ jobs:
       matrix:
         zoraxy_version: [v3.3.0, v3.3.1, v3.3.2, v3.3.3]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ inputs.ref }}
       - name: Run Playwright through Zoraxy
-        run: DOCKER=docker ZORAXY_VERSION=${{ matrix.zoraxy_version }} make e2e-test
+        run: DOCKER=docker CI=true E2E_SUITE=compatibility ZORAXY_VERSION=${{ matrix.zoraxy_version }} make e2e-test
+      - name: Collect E2E artifacts
+        if: always()
+        run: |
+          mkdir -p artifacts
+          docker compose -f tests/docker/docker-compose.test.yml logs --no-color > artifacts/compose.log
+          docker compose -f tests/docker/docker-compose.test.yml cp e2e:/e2e/playwright-report artifacts/playwright-report || true
+          docker compose -f tests/docker/docker-compose.test.yml cp e2e:/e2e/test-results artifacts/test-results || true
+      - name: Clean up E2E environment
+        if: always()
+        run: DOCKER=docker make e2e-clean
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-${{ matrix.zoraxy_version }}
+          path: artifacts
+          if-no-files-found: ignore
+
+  certwarden-api:
+    name: E2E Cert Warden API v3.3.3
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
+      - name: Run full Cert Warden API Playwright suite
+        run: DOCKER=docker CI=true E2E_SUITE=certwarden-api ZORAXY_VERSION=v3.3.3 make e2e-test
+      - name: Collect E2E artifacts
+        if: always()
+        run: |
+          mkdir -p artifacts
+          docker compose -f tests/docker/docker-compose.test.yml logs --no-color > artifacts/compose.log
+          docker compose -f tests/docker/docker-compose.test.yml cp e2e:/e2e/playwright-report artifacts/playwright-report || true
+          docker compose -f tests/docker/docker-compose.test.yml cp e2e:/e2e/test-results artifacts/test-results || true
+      - name: Clean up E2E environment
+        if: always()
+        run: DOCKER=docker make e2e-clean
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-certwarden-api-v3.3.3
+          path: artifacts
+          if-no-files-found: ignore
 
   stable-aggregate:
     name: E2E stable
     if: always()
     runs-on: ubuntu-latest
-    needs: stable
+    needs: [stable, certwarden-api]
     steps:
       - name: Require the stable matrix
         env:
-          RESULT: ${{ needs.stable.result }}
-        run: test "$RESULT" = "success"
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          for result in $RESULTS; do
+            test "$result" = "success"
+          done
 
   canary:
     name: E2E canary Zoraxy ${{ matrix.zoraxy_version }}
@@ -52,8 +97,24 @@ jobs:
       matrix:
         zoraxy_version: [v3.3.4-rc1, v3.3.4-rc2, v3.3.4-rc3, latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ inputs.ref }}
       - name: Run nonblocking Playwright canary
-        run: DOCKER=docker ZORAXY_VERSION=${{ matrix.zoraxy_version }} make e2e-test
+        run: DOCKER=docker CI=true E2E_SUITE=compatibility ZORAXY_VERSION=${{ matrix.zoraxy_version }} make e2e-test
+      - name: Collect E2E artifacts
+        if: always()
+        run: |
+          mkdir -p artifacts
+          docker compose -f tests/docker/docker-compose.test.yml logs --no-color > artifacts/compose.log
+          docker compose -f tests/docker/docker-compose.test.yml cp e2e:/e2e/playwright-report artifacts/playwright-report || true
+          docker compose -f tests/docker/docker-compose.test.yml cp e2e:/e2e/test-results artifacts/test-results || true
+      - name: Clean up E2E environment
+        if: always()
+        run: DOCKER=docker make e2e-clean
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-canary-${{ matrix.zoraxy_version }}
+          path: artifacts
+          if-no-files-found: ignore

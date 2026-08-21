@@ -77,6 +77,11 @@ func Sync(cfg config.CertificateConfig, policy *config.PathPolicy) (*certutil.Ce
 		res.Error = err
 		return nil, res, err
 	}
+	if cfg.Source.Type != "" && cfg.Source.Type != config.SourceTypeLocal {
+		err := fmt.Errorf("filesystem sync requires a local source")
+		res.Error = err
+		return nil, res, err
+	}
 	certPath, err := policy.ResolveSource(cfg.Source.Certificate, true)
 	if err != nil {
 		res.Error = err
@@ -95,6 +100,16 @@ func Sync(cfg config.CertificateConfig, policy *config.PathPolicy) (*certutil.Ce
 	}
 	keyPEM, err := os.ReadFile(keyPath)
 	if err != nil {
+		res.Error = err
+		return nil, res, err
+	}
+	return SyncMaterial(cfg, certPEM, keyPEM, policy)
+}
+
+// SyncMaterial validates and installs certificate material already held in memory.
+func SyncMaterial(cfg config.CertificateConfig, certPEM, keyPEM []byte, policy *config.PathPolicy) (*certutil.CertInfo, *Result, error) {
+	res := &Result{}
+	if err := cfg.Validate(false, policy); err != nil {
 		res.Error = err
 		return nil, res, err
 	}

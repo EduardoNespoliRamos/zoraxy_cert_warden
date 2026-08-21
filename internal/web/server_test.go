@@ -21,7 +21,14 @@ type testManager struct {
 	mu                                                        sync.Mutex
 	cfg                                                       *config.Config
 	pending                                                   bool
+	configured                                                map[string]credentialState
+	credentialMutations                                       []CredentialMutation
+	certWardenTestCalls                                       []certWardenTestCall
 	applyErr, mutateErr, syncErr, validateErr, acknowledgeErr error
+}
+
+type certWardenTestCall struct {
+	serverURL, certificateName, certificateAPIKey, privateKeyAPIKey string
 }
 
 func (m *testManager) SnapshotConfig() *config.Config {
@@ -52,8 +59,39 @@ func (m *testManager) MutateConfig(_ context.Context, mutation ConfigMutation) e
 	m.cfg = candidate
 	return nil
 }
+func (m *testManager) MutateConfigAndCredentials(_ context.Context, mutation ConfigMutation, credentials *CredentialMutation) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	candidate := m.cfg.Clone()
+	if err := mutation(candidate); err != nil {
+		return err
+	}
+	if m.mutateErr != nil {
+		return m.mutateErr
+	}
+	m.cfg = candidate
+	if credentials != nil {
+		m.credentialMutations = append(m.credentialMutations, *credentials)
+	}
+	return nil
+}
+func (m *testManager) CredentialsConfigured(name string) (bool, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	configured := m.configured[name]
+	return configured.CertificateAPIKey, configured.PrivateKeyAPIKey
+}
 func (m *testManager) SyncCertificate(string) error     { return m.syncErr }
 func (m *testManager) ValidateCertificate(string) error { return m.validateErr }
+func (m *testManager) TestCertWardenConnection(_ context.Context, serverURL, certificateName, certificateAPIKey, privateKeyAPIKey string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.certWardenTestCalls = append(m.certWardenTestCalls, certWardenTestCall{
+		serverURL: serverURL, certificateName: certificateName,
+		certificateAPIKey: certificateAPIKey, privateKeyAPIKey: privateKeyAPIKey,
+	})
+	return m.validateErr
+}
 func (m *testManager) FallbackRestartPending() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -136,6 +174,107 @@ func TestStrictJSONDecoder(t *testing.T) {
 			}
 			if got := response.Header().Get("Content-Type"); got != "application/json" {
 				t.Fatalf("Content-Type=%q", got)
+			}
+		})
+	}
+}
+
+func TestCertWardenTestStrictRequestParsing(t *testing.T) {
+	tests := []struct {
+		name, body, contentType string
+		want                    int
+	}{
+		{name: "empty", contentType: "application/json", want: http.StatusBadRequest},
+		{name: "unknown field", body: `{"server_url":"https://warden.example","unknown":true}`, contentType: "application/json", want: http.StatusBadRequest},
+		{name: "second JSON value", body: `{} {}`, contentType: "application/json", want: http.StatusBadRequest},
+		{name: "trailing garbage", body: `{} trailing`, contentType: "application/json", want: http.StatusBadRequest},
+		{name: "wrong content type", body: `{}`, contentType: "text/plain", want: http.StatusUnsupportedMediaType},
+		{name: "oversized", body: `{"certificate_api_key":"` + strings.Repeat("a", int(maxRequestBodyBytes)) + `"}`, contentType: "application/json", want: http.StatusRequestEntityTooLarge},
+	}
+	for _, route := range []struct {
+		name, path string
+	}{
+		{name: "direct", path: "/api/certwarden/test"},
+		{name: "prefixed", path: "/custom/proxy/api/certwarden/test"},
+	} {
+		for _, test := range tests {
+			t.Run(route.name+"/"+test.name, func(t *testing.T) {
+				manager := &testManager{cfg: &config.Config{LogLevel: "info"}}
+				response := request(t, testHandler(manager), http.MethodPost, route.path, test.body, test.contentType)
+				if response.Code != test.want {
+					t.Fatalf("code=%d body=%s; want %d", response.Code, response.Body.String(), test.want)
+				}
+				if response.Header().Get("Content-Type") != "application/json" {
+					t.Fatalf("Content-Type=%q", response.Header().Get("Content-Type"))
+				}
+				if len(manager.certWardenTestCalls) != 0 {
+					t.Fatalf("invalid request reached manager: %+v", manager.certWardenTestCalls)
+				}
+			})
+		}
+	}
+}
+
+func TestCertWardenTestRoutesPassValuesAndReturnSuccess(t *testing.T) {
+	want := certWardenTestCall{
+		serverURL: "https://warden.example:8443", certificateName: "example.com",
+		certificateAPIKey: "certificate-secret", privateKeyAPIKey: "private-secret",
+	}
+	body := `{"server_url":"` + want.serverURL + `","certificate_name":"` + want.certificateName + `","certificate_api_key":"` + want.certificateAPIKey + `","private_key_api_key":"` + want.privateKeyAPIKey + `"}`
+	for _, route := range []struct {
+		name, path string
+	}{
+		{name: "direct", path: "/api/certwarden/test"},
+		{name: "prefixed", path: "/custom/proxy/api/certwarden/test"},
+	} {
+		t.Run(route.name, func(t *testing.T) {
+			manager := &testManager{cfg: &config.Config{LogLevel: "info"}}
+			var logs bytes.Buffer
+			logger := slog.New(slog.NewTextHandler(&logs, nil))
+			response := request(t, testHandler(manager, logger), http.MethodPost, route.path, body, "application/json")
+			if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"status":"ok"`) {
+				t.Fatalf("code=%d body=%s", response.Code, response.Body.String())
+			}
+			if len(manager.certWardenTestCalls) != 1 || manager.certWardenTestCalls[0] != want {
+				t.Fatalf("manager calls=%+v; want %+v", manager.certWardenTestCalls, want)
+			}
+			for _, secret := range []string{want.certificateAPIKey, want.privateKeyAPIKey} {
+				if strings.Contains(response.Body.String(), secret) || strings.Contains(logs.String(), secret) {
+					t.Fatalf("credential %q exposed in response or logs", secret)
+				}
+			}
+		})
+	}
+}
+
+func TestCertWardenTestValidationErrorIsSafe(t *testing.T) {
+	const certificateAPIKey = "certificate-secret"
+	const privateKeyAPIKey = "private-secret"
+	body := `{"server_url":"https://warden.example","certificate_name":"example.com","certificate_api_key":"` + certificateAPIKey + `","private_key_api_key":"` + privateKeyAPIKey + `"}`
+	for _, route := range []struct {
+		name, path string
+	}{
+		{name: "direct", path: "/api/certwarden/test"},
+		{name: "prefixed", path: "/custom/proxy/api/certwarden/test"},
+	} {
+		t.Run(route.name, func(t *testing.T) {
+			manager := &testManager{
+				cfg:         &config.Config{LogLevel: "info"},
+				validateErr: testSourceValidationError{errors.New("remote certificate validation failed")},
+			}
+			var logs bytes.Buffer
+			logger := slog.New(slog.NewTextHandler(&logs, nil))
+			response := request(t, testHandler(manager, logger), http.MethodPost, route.path, body, "application/json")
+			if response.Code != http.StatusUnprocessableEntity || !strings.Contains(response.Body.String(), "certificate validation failed") {
+				t.Fatalf("code=%d body=%s", response.Code, response.Body.String())
+			}
+			if len(manager.certWardenTestCalls) != 1 {
+				t.Fatalf("manager calls=%d; want 1", len(manager.certWardenTestCalls))
+			}
+			for _, secret := range []string{certificateAPIKey, privateKeyAPIKey} {
+				if strings.Contains(response.Body.String(), secret) || strings.Contains(logs.String(), secret) {
+					t.Fatalf("credential %q exposed in response or logs", secret)
+				}
 			}
 		})
 	}
@@ -274,5 +413,111 @@ func TestFallbackRestartAcknowledgeRoutes(t *testing.T) {
 		if response.Code != http.StatusOK || manager.FallbackRestartPending() {
 			t.Fatalf("acknowledge failed for %s: code=%d body=%s", path, response.Code, response.Body.String())
 		}
+	}
+}
+
+func TestRemoteCredentialsAreMaskedInConfigResponses(t *testing.T) {
+	manager := &testManager{
+		cfg: &config.Config{LogLevel: "info", Certificates: []config.CertificateConfig{{
+			Name: "remote", Source: config.CertificateSource{Type: config.SourceTypeCertWarden},
+		}}},
+		configured: map[string]credentialState{
+			"remote": {CertificateAPIKey: true, PrivateKeyAPIKey: false},
+		},
+	}
+	for _, path := range []string{"/api/config", "/api/certificates"} {
+		t.Run(path, func(t *testing.T) {
+			response := request(t, testHandler(manager), http.MethodGet, path, "", "")
+			if response.Code != http.StatusOK {
+				t.Fatalf("code=%d body=%s", response.Code, response.Body.String())
+			}
+			body := response.Body.String()
+			if !strings.Contains(body, `"certificate_api_key_configured":true`) || !strings.Contains(body, `"private_key_api_key_configured":false`) {
+				t.Fatalf("configured credential state missing: %s", body)
+			}
+			if strings.Contains(body, `"certificate_api_key":`) || strings.Contains(body, `"private_key_api_key":`) {
+				t.Fatalf("response exposed credential values: %s", body)
+			}
+		})
+	}
+}
+
+func TestCreateRemoteCertificateRequiresBothCredentials(t *testing.T) {
+	tests := []struct {
+		name        string
+		credentials string
+		want        int
+	}{
+		{name: "omitted", credentials: "", want: http.StatusBadRequest},
+		{name: "certificate only", credentials: `,"cert_warden_credentials":{"certificate_api_key":"certificate-value"}`, want: http.StatusBadRequest},
+		{name: "private key only", credentials: `,"cert_warden_credentials":{"private_key_api_key":"private-value"}`, want: http.StatusBadRequest},
+		{name: "both", credentials: `,"cert_warden_credentials":{"certificate_api_key":"certificate-value","private_key_api_key":"private-value"}`, want: http.StatusOK},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			manager := &testManager{cfg: &config.Config{LogLevel: "info"}}
+			body := `{"name":"remote","source":{"type":"cert_warden"}` + test.credentials + `}`
+			response := request(t, testHandler(manager), http.MethodPost, "/api/certificates", body, "application/json")
+			if response.Code != test.want {
+				t.Fatalf("code=%d body=%s", response.Code, response.Body.String())
+			}
+			if test.want != http.StatusOK && (len(manager.credentialMutations) != 0 || len(manager.SnapshotConfig().Certificates) != 0) {
+				t.Fatal("invalid create mutated configuration or credentials")
+			}
+			if test.want == http.StatusOK && (len(manager.credentialMutations) != 1 || manager.credentialMutations[0].CertificateAPIKey == nil || manager.credentialMutations[0].PrivateKeyAPIKey == nil) {
+				t.Fatalf("complete credentials were not passed to the manager: %+v", manager.credentialMutations)
+			}
+		})
+	}
+}
+
+func TestRemoteCredentialMutations(t *testing.T) {
+	tests := []struct {
+		name       string
+		method     string
+		body       string
+		wantDelete bool
+	}{
+		{
+			name:   "remote update omitting credentials preserves them",
+			method: http.MethodPut,
+			body:   `{"name":"remote","source":{"type":"cert_warden"}}`,
+		},
+		{
+			name:       "switching to local deletes credentials",
+			method:     http.MethodPut,
+			body:       `{"name":"remote","source":{"type":"local"}}`,
+			wantDelete: true,
+		},
+		{
+			name:       "deleting certificate deletes credentials",
+			method:     http.MethodDelete,
+			wantDelete: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			manager := &testManager{cfg: &config.Config{Certificates: []config.CertificateConfig{{
+				Name: "remote", Source: config.CertificateSource{Type: config.SourceTypeCertWarden},
+			}}}}
+			contentType := ""
+			if test.method == http.MethodPut {
+				contentType = "application/json"
+			}
+			response := request(t, testHandler(manager), test.method, "/api/certificates/remote", test.body, contentType)
+			if response.Code != http.StatusOK {
+				t.Fatalf("code=%d body=%s", response.Code, response.Body.String())
+			}
+			if len(manager.credentialMutations) != 1 {
+				t.Fatalf("credential mutations=%d; want 1", len(manager.credentialMutations))
+			}
+			mutation := manager.credentialMutations[0]
+			if mutation.Name != "remote" || mutation.Delete != test.wantDelete {
+				t.Fatalf("unexpected credential mutation: %+v", mutation)
+			}
+			if mutation.CertificateAPIKey != nil || mutation.PrivateKeyAPIKey != nil {
+				t.Fatalf("omitted credentials unexpectedly supplied values: %+v", mutation)
+			}
+		})
 	}
 }

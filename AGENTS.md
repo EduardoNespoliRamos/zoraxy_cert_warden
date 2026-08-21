@@ -5,14 +5,15 @@ Agent-focused guidance for the **Zoraxy Cert Warden Sync** plugin.
 ## Project overview
 
 This is a Zoraxy plugin (ID `com.eduardoramos.zoraxy.certwarden`) that
-synchronizes TLS certificates produced by the Cert Warden Client into Zoraxy's
-certificate store. It uses the Go 1.23 language/module baseline and a patched
-Go 1.25 build toolchain, and is distributed under AGPLv3.
+synchronizes TLS certificates from local Cert Warden Client files or directly
+from the Cert Warden HTTPS API into Zoraxy's certificate store. It uses the Go
+1.23 language/module baseline and a patched Go 1.25 build toolchain, and is
+distributed under AGPLv3.
 
 Key facts:
 
-- The plugin **does not** handle ACME or DNS challenges. It only consumes PEM
-  files already written by the Cert Warden Client.
+- The plugin **does not** handle ACME or DNS challenges. It consumes existing
+  PEM material from local files or Cert Warden's combined download endpoint.
 - It runs as a separate process launched by Zoraxy and exposes a web UI through
   Zoraxy's plugin proxy.
 - It listens on `127.0.0.1` and is reached via Zoraxy's authenticated management
@@ -26,14 +27,18 @@ cmd/cert-sync/          # Plugin entry point and embedded web UI
   main.go               # Plugin lifecycle, watchers, sync runner
   web/                  # Embedded static files (HTML/CSS/JS)
 internal/
+  certwarden/           # HTTPS API client and sanitized fetch errors
   certutil/             # Certificate parsing, validation, fingerprinting
   config/               # Config model, validation, persistence
+  poller/               # Non-overlapping remote-source polling
+  secretstore/          # Write-only per-entry API credential persistence
   status/               # In-memory status aggregation
   sync/                 # Transactional pair replacement, fallback.json
   watcher/              # fsnotify + polling watcher with debounce
   web/                  # HTTP handlers for the plugin UI API
 mod/zoraxy_plugin/      # Zoraxy plugin SDK (vendored minimal module)
 tests/
+  certwardenmock/       # Controllable HTTPS Cert Warden test double
   integration/          # Go integration tests against real files
   e2e/                  # Playwright tests against Zoraxy in Docker
   docker/               # Docker Compose environment for tests
@@ -54,7 +59,9 @@ make build-all
 # Tests
 make test              # unit tests
 make integration-test  # integration tests against ZORAXY_VERSION (default v3.3.3)
+make certwarden-api-test # focused API client, secrets, and mock tests
 make e2e-test          # Playwright E2E tests against v3.3.3
+make e2e-remote-test   # remote Cert Warden API Playwright suite
 
 # Use Docker instead of Podman
 DOCKER=docker make build-all
@@ -67,29 +74,31 @@ make clean
 ## Architecture
 
 ```
-Cert Warden Client writes PEM files
-              |
-              v
-    internal/watcher (fsnotify + poll)
-              |
-              v
-    internal/sync (validate, transactional pair replacement)
-              |
-              v
-    Zoraxy certificate store (/opt/zoraxy/config/conf/certs)
+Local PEM files -> internal/watcher --\
+                                      -> validate -> internal/sync -> Zoraxy store
+Cert Warden API -> certwarden/poller -/
 ```
 
 - **Watcher**: monitors source certificate/key files. Uses `fsnotify` with a
   polling fallback. Debounces rapid changes so certificate + key updates are
   treated as one event.
+- **Remote client/poller**: calls the HTTPS-only official combined endpoint with
+  the two per-certificate API keys, never follows redirects, validates TLS, and
+  classifies sanitized query failures. Enabled remote entries fetch and sync
+  once when config is applied; Auto Sync adds polling (300-second default,
+  60-second minimum). Manual Test Connection and Sync Now remain available.
+- **Secret store**: keeps remote credentials in `secrets.json` with mode `0600`.
+  API/UI reads expose only configured booleans; keys are write-only.
 - **Syncer**: validates the presented certificate chain and unencrypted private
   key, then compares a SHA-256 bundle digest covering the ordered chain and
   public key. It stages both files and replaces them transactionally with
   backups and rollback; the two-file replacement is not filesystem-atomic as a
   unit. Keys use `0600` and certificates use `0644`.
-- **Status**: independently tracks source validation, destination validation,
-  synchronization, and watcher errors. Entries are Healthy, Error, Unknown, or
-  Disabled; disabled entries remain visible but do not degrade aggregate health.
+- **Status**: independently tracks remote query, source validation, destination
+  validation, synchronization, and watcher errors. Remote query status includes
+  timing, latency, HTTP status, and failure category. Entries are Healthy,
+  Error, Unknown, or Disabled; disabled entries remain visible but do not
+  degrade aggregate health.
 - **Web server**: serves the embedded UI and exposes a JSON API.
 
 ## Zoraxy plugin constraints
@@ -122,6 +131,16 @@ When changing the web UI or API, keep these constraints in mind:
    `CERT_SYNC_ALLOWED_SOURCE_ROOTS` and
    `CERT_SYNC_ALLOWED_DESTINATION_ROOTS`. Do not make these roots editable from
    the web UI or bypass `config.PathPolicy` at filesystem boundaries.
+
+6. **Remote origins are HTTPS-only but host-unrestricted by design.** Valid TLS
+   and hostname verification are mandatory and redirects are disabled. Any
+   HTTPS host, including internal or link-local addresses, is accepted to
+   support private Cert Warden servers. Preserve this explicit product decision
+   unless requirements change, and account for SSRF/internal-service risk.
+
+7. **Remote credentials are write-only.** Both per-certificate keys are required
+   and stored by immutable entry name in `secrets.json`. Never return or log
+   them. Preserve the UI's masked empty password fields and configured booleans.
 
 ## Coding conventions
 
@@ -200,6 +219,17 @@ Administrators can bypass these settings if needed.
 4. Update `cmd/cert-sync/web/js/app.js` if the UI needs to consume it. Remember
    to include CSRF headers for mutating methods.
 5. Add tests.
+
+### Change Cert Warden API support
+
+1. Keep `internal/certwarden` transport errors sanitized and credentials out of
+   config, status, API responses, and logs.
+2. Update `internal/config`, `internal/secretstore`, manager startup/polling, and
+   the three UI status groups only as required.
+3. Test with `make certwarden-api-test` and `make e2e-remote-test`; extend the
+   controllable HTTPS mock rather than depending on a live Cert Warden server.
+4. Document custom trust through the system CA store or `SSL_CERT_FILE`; never
+   add an insecure TLS option.
 
 ### Update the Zoraxy version matrix
 
