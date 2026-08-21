@@ -125,6 +125,9 @@ services:
       - "80:80"
       - "443:443"
       - "8000:8000"
+    environment:
+      - CERT_SYNC_ALLOWED_SOURCE_ROOTS=/cert_warden_plugin
+      - CERT_SYNC_ALLOWED_DESTINATION_ROOTS=/opt/zoraxy/config/conf/certs
     volumes:
       - /mnt/raid/docker-compose/zoraxy/config:/opt/zoraxy/config
       - /mnt/raid/docker-compose/zoraxy/plugin:/opt/zoraxy/plugin
@@ -152,6 +155,27 @@ Cert Warden Client output:
 - Target name: `homealone-wildcard`
 
 Configuration is persisted in `config.json` inside the plugin directory.
+
+### Path allowlists
+
+The plugin only reads and writes paths below operator-approved roots. Configure
+the roots through environment variables; they cannot be changed from the web
+UI:
+
+- `CERT_SYNC_ALLOWED_SOURCE_ROOTS` defaults to `/cert_warden_plugin`.
+- `CERT_SYNC_ALLOWED_DESTINATION_ROOTS` defaults to
+  `/opt/zoraxy/config/conf/certs`.
+
+Use the operating system path-list separator to allow multiple roots. On Linux,
+separate them with `:`:
+
+```bash
+CERT_SYNC_ALLOWED_SOURCE_ROOTS=/cert_warden_plugin:/mnt/other-certs
+```
+
+Paths must be absolute and normalized, and may contain letters, numbers, `/`,
+`.`, `_`, and `-`. Symlinks are resolved before access and cannot escape the
+configured roots.
 
 ## UI
 
@@ -304,6 +328,7 @@ store. In Docker, this is usually the same user running the Zoraxy container.
 
 ## Security
 
+- Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
 - Private keys are never logged or returned by the API.
 - Key files are written with mode `0600`.
 - Certificate files are written with mode `0644`.

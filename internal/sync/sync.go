@@ -11,26 +11,50 @@ import (
 )
 
 const (
-	publicCertFileMode  os.FileMode = 0644
-	privateKeyFileMode  os.FileMode = 0600
-	fallbackFileMode    os.FileMode = 0644
+	publicCertFileMode os.FileMode = 0644
+	privateKeyFileMode os.FileMode = 0600
+	fallbackFileMode   os.FileMode = 0644
 )
 
 // Result describes the outcome of a sync attempt.
 type Result struct {
-	Synced     bool
-	NoChanges  bool
-	SourceFP   string
-	DestFP     string
-	Fallback   bool
-	Error      error
+	Synced    bool
+	NoChanges bool
+	SourceFP  string
+	DestFP    string
+	Fallback  bool
+	Error     error
 }
 
 // Sync performs a validated atomic sync from source to destination.
-func Sync(cfg config.CertificateConfig) (*certutil.CertInfo, *Result, error) {
+func Sync(cfg config.CertificateConfig, policy *config.PathPolicy) (*certutil.CertInfo, *Result, error) {
 	res := &Result{}
+	if err := cfg.Validate(false, policy); err != nil {
+		res.Error = err
+		return nil, res, err
+	}
+	certPath, err := policy.ResolveSource(cfg.Source.Certificate, true)
+	if err != nil {
+		res.Error = err
+		return nil, res, err
+	}
+	keyPath, err := policy.ResolveSource(cfg.Source.PrivateKey, true)
+	if err != nil {
+		res.Error = err
+		return nil, res, err
+	}
 
-	certInfo, err := certutil.LoadAndValidate(cfg.Source.Certificate, cfg.Source.PrivateKey)
+	certPEM, err := os.ReadFile(certPath)
+	if err != nil {
+		res.Error = err
+		return nil, res, err
+	}
+	keyPEM, err := os.ReadFile(keyPath)
+	if err != nil {
+		res.Error = err
+		return nil, res, err
+	}
+	certInfo, err := certutil.ValidatePEMPair(certPEM, keyPEM)
 	if err != nil {
 		res.Error = err
 		return nil, res, err
@@ -40,7 +64,7 @@ func Sync(cfg config.CertificateConfig) (*certutil.CertInfo, *Result, error) {
 	destDir := cfg.Destination.TargetDirectory
 	destName := cfg.Destination.TargetName
 
-	destFP, err := ReadDestinationFingerprint(destDir, destName)
+	destFP, err := ReadDestinationFingerprint(destDir, destName, policy)
 	if err == nil {
 		res.DestFP = destFP
 	}
@@ -48,7 +72,7 @@ func Sync(cfg config.CertificateConfig) (*certutil.CertInfo, *Result, error) {
 	if certutil.IsSameFingerprint(certInfo.Fingerprint, destFP) {
 		res.NoChanges = true
 		if cfg.Fallback {
-			if err := WriteFallback(destDir, destName); err != nil {
+			if err := WriteFallback(destDir, destName, policy); err != nil {
 				res.Error = err
 				return certInfo, res, err
 			}
@@ -57,25 +81,14 @@ func Sync(cfg config.CertificateConfig) (*certutil.CertInfo, *Result, error) {
 		return certInfo, res, nil
 	}
 
-	certPEM, err := os.ReadFile(cfg.Source.Certificate)
-	if err != nil {
-		res.Error = err
-		return certInfo, res, err
-	}
-	keyPEM, err := os.ReadFile(cfg.Source.PrivateKey)
-	if err != nil {
-		res.Error = err
-		return certInfo, res, err
-	}
-
-	if err := AtomicWrite(destDir, destName, certPEM, keyPEM); err != nil {
+	if err := AtomicWrite(destDir, destName, certPEM, keyPEM, policy); err != nil {
 		res.Error = err
 		return certInfo, res, err
 	}
 	res.Synced = true
 
 	if cfg.Fallback {
-		if err := WriteFallback(destDir, destName); err != nil {
+		if err := WriteFallback(destDir, destName, policy); err != nil {
 			res.Error = err
 			return certInfo, res, err
 		}
@@ -86,23 +99,26 @@ func Sync(cfg config.CertificateConfig) (*certutil.CertInfo, *Result, error) {
 }
 
 // AtomicWrite writes certificate and key files atomically.
-func AtomicWrite(destDir, destName string, certPEM, keyPEM []byte) error {
+func AtomicWrite(destDir, destName string, certPEM, keyPEM []byte, policy *config.PathPolicy) error {
+	resolvedDir, err := policy.ResolveDestination(destDir, false)
+	if err != nil {
+		return err
+	}
+	destDir = resolvedDir
 	if err := os.MkdirAll(destDir, 0755); err != nil {
 		return fmt.Errorf("failed to create target directory: %w", err)
 	}
 
 	pemPath := filepath.Join(destDir, destName+".pem")
 	keyPath := filepath.Join(destDir, destName+".key")
-	pemTmp := pemPath + ".tmp"
-	keyTmp := keyPath + ".tmp"
 
-	if err := writeAndSync(pemTmp, certPEM, publicCertFileMode); err != nil {
-		os.Remove(pemTmp)
+	pemTmp, err := writeTempFile(destDir, "."+destName+"-*.pem.tmp", certPEM, publicCertFileMode)
+	if err != nil {
 		return fmt.Errorf("failed to write certificate temp file: %w", err)
 	}
-	if err := writeAndSync(keyTmp, keyPEM, privateKeyFileMode); err != nil {
+	keyTmp, err := writeTempFile(destDir, "."+destName+"-*.key.tmp", keyPEM, privateKeyFileMode)
+	if err != nil {
 		os.Remove(pemTmp)
-		os.Remove(keyTmp)
 		return fmt.Errorf("failed to write private key temp file: %w", err)
 	}
 
@@ -119,28 +135,47 @@ func AtomicWrite(destDir, destName string, certPEM, keyPEM []byte) error {
 	return nil
 }
 
-func writeAndSync(path string, data []byte, mode os.FileMode) error {
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
+func writeTempFile(dir, pattern string, data []byte, mode os.FileMode) (string, error) {
+	file, err := os.CreateTemp(dir, pattern)
 	if err != nil {
-		return err
+		return "", err
 	}
-	defer file.Close()
+	path := file.Name()
+	ok := false
+	defer func() {
+		file.Close()
+		if !ok {
+			os.Remove(path)
+		}
+	}()
 
 	if _, err := file.Write(data); err != nil {
-		return err
+		return "", err
 	}
 	if err := file.Sync(); err != nil {
-		return err
+		return "", err
 	}
 	if err := file.Chmod(mode); err != nil {
-		return err
+		return "", err
 	}
-	return nil
+	if err := file.Close(); err != nil {
+		return "", err
+	}
+	ok = true
+	return path, nil
 }
 
 // ReadDestinationFingerprint reads the fingerprint of the destination certificate.
-func ReadDestinationFingerprint(destDir, destName string) (string, error) {
+func ReadDestinationFingerprint(destDir, destName string, policy *config.PathPolicy) (string, error) {
+	resolvedDir, err := policy.ResolveDestination(destDir, false)
+	if err != nil {
+		return "", err
+	}
+	destDir = resolvedDir
 	pemPath := filepath.Join(destDir, destName+".pem")
+	if err := rejectSymlink(pemPath); err != nil {
+		return "", err
+	}
 	data, err := os.ReadFile(pemPath)
 	if err != nil {
 		return "", err
@@ -149,7 +184,12 @@ func ReadDestinationFingerprint(destDir, destName string) (string, error) {
 }
 
 // WriteFallback writes the fallback.json file used by Zoraxy.
-func WriteFallback(destDir, destName string) error {
+func WriteFallback(destDir, destName string, policy *config.PathPolicy) error {
+	resolvedDir, err := policy.ResolveDestination(destDir, false)
+	if err != nil {
+		return err
+	}
+	destDir = resolvedDir
 	if err := os.MkdirAll(destDir, 0755); err != nil {
 		return fmt.Errorf("failed to create target directory: %w", err)
 	}
@@ -158,17 +198,25 @@ func WriteFallback(destDir, destName string) error {
 		return err
 	}
 	path := filepath.Join(destDir, "fallback.json")
-	tmp := path + ".tmp"
-	if err := writeAndSync(tmp, data, fallbackFileMode); err != nil {
-		os.Remove(tmp)
+	tmp, err := writeTempFile(destDir, ".fallback-*.json.tmp", data, fallbackFileMode)
+	if err != nil {
 		return err
 	}
+	defer os.Remove(tmp)
 	return os.Rename(tmp, path)
 }
 
 // ReadFallback reads the currently configured fallback certificate name.
-func ReadFallback(destDir string) (string, error) {
+func ReadFallback(destDir string, policy *config.PathPolicy) (string, error) {
+	resolvedDir, err := policy.ResolveDestination(destDir, false)
+	if err != nil {
+		return "", err
+	}
+	destDir = resolvedDir
 	path := filepath.Join(destDir, "fallback.json")
+	if err := rejectSymlink(path); err != nil {
+		return "", err
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return "", err
@@ -180,4 +228,18 @@ func ReadFallback(destDir string) (string, error) {
 		return "", err
 	}
 	return fb.FallbackCert, nil
+}
+
+func rejectSymlink(path string) error {
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("refusing to read symlink: %s", path)
+	}
+	return nil
 }
