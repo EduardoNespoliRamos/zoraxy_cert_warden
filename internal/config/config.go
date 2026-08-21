@@ -296,43 +296,7 @@ func Load(path string, policy *PathPolicy) (*Config, error) {
 	return cfg, nil
 }
 
-// Save writes configuration to a JSON file atomically.
+// Save writes configuration durably without modifying the receiver.
 func (cfg *Config) Save(path string, policy *PathPolicy) error {
-	normalized := cfg.Clone()
-	if normalized == nil {
-		return fmt.Errorf("configuration is required")
-	}
-	normalized.Normalize()
-	if err := normalized.Validate(false, policy); err != nil {
-		return err
-	}
-	data, err := json.MarshalIndent(normalized, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to marshal config: %w", err)
-	}
-	tmpFile, err := os.CreateTemp(filepath.Dir(path), ".config-*.json.tmp")
-	if err != nil {
-		return fmt.Errorf("failed to write config temp file: %w", err)
-	}
-	tmp := tmpFile.Name()
-	defer os.Remove(tmp)
-	if err := tmpFile.Chmod(0600); err != nil {
-		tmpFile.Close()
-		return fmt.Errorf("failed to secure config temp file: %w", err)
-	}
-	if _, err := tmpFile.Write(data); err != nil {
-		tmpFile.Close()
-		return fmt.Errorf("failed to write config temp file: %w", err)
-	}
-	if err := tmpFile.Sync(); err != nil {
-		tmpFile.Close()
-		return fmt.Errorf("failed to sync config temp file: %w", err)
-	}
-	if err := tmpFile.Close(); err != nil {
-		return fmt.Errorf("failed to close config temp file: %w", err)
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		return fmt.Errorf("failed to rename config file: %w", err)
-	}
-	return nil
+	return NewStore(nil).Save(cfg, path, policy)
 }
