@@ -1,10 +1,16 @@
 const API = {
     status: './api/status',
-    config: './api/config',
     certificates: './api/certificates'
 };
 
+const POLL_INTERVAL_MS = 10000;
+const modalActionButtons = ['btn-save', 'btn-validate', 'btn-sync-now', 'btn-delete'];
 let currentCertName = null;
+let modalOperationInFlight = false;
+let statusRequest = null;
+let statusRequestSequence = 0;
+let statusTimer = null;
+const syncingCertificates = new Set();
 
 function getCsrfToken() {
     const meta = document.querySelector('meta[name="zoraxy.csrf.Token"]');
@@ -12,93 +18,190 @@ function getCsrfToken() {
 }
 
 async function fetchJSON(url, options = {}) {
-    const needsToken = ['POST', 'PUT', 'DELETE', 'PATCH'].includes((options.method || 'GET').toUpperCase());
+    const requestOptions = { ...options, headers: { ...(options.headers || {}) } };
+    const needsToken = ['POST', 'PUT', 'DELETE', 'PATCH'].includes((requestOptions.method || 'GET').toUpperCase());
     if (needsToken) {
-        options.headers = options.headers || {};
-        options.headers['X-CSRF-Token'] = getCsrfToken();
+        requestOptions.headers['X-CSRF-Token'] = getCsrfToken();
     }
-    const res = await fetch(url, options);
-    if (!res.ok) {
-        const body = await res.json().catch(() => ({ error: 'Unknown error' }));
-        throw new Error(body.error || `HTTP ${res.status}`);
+    const response = await fetch(url, requestOptions);
+    if (!response.ok) {
+        const body = await response.json().catch(() => ({ error: 'Unknown error' }));
+        throw new Error(body.error || `HTTP ${response.status}`);
     }
-    return res.json();
+    return response.json();
 }
 
 function formatDate(iso) {
     if (!iso) return 'Never';
-    const d = new Date(iso);
-    return d.toLocaleString();
+    const date = new Date(iso);
+    return Number.isNaN(date.getTime()) ? 'N/A' : date.toLocaleString();
 }
 
-function formatFP(fp) {
-    if (!fp) return 'N/A';
-    return fp.substring(0, 16) + '...';
+function formatFP(fingerprint) {
+    if (!fingerprint) return 'N/A';
+    return `${String(fingerprint).substring(0, 16)}...`;
+}
+
+function statusClass(status) {
+    const normalized = String(status || '').toLowerCase();
+    return ['healthy', 'error', 'unknown', 'disabled'].includes(normalized)
+        ? `status-${normalized}`
+        : 'status-unknown';
+}
+
+function appendParagraph(parent, text, className) {
+    const paragraph = document.createElement('p');
+    paragraph.textContent = text;
+    if (className) paragraph.className = className;
+    parent.appendChild(paragraph);
+    return paragraph;
 }
 
 function renderOverview(data) {
-    const el = document.getElementById('overview-content');
-    el.innerHTML = `
-        <p>Status: <span class="status-${data.status.toLowerCase()}">${data.status}</span></p>
-        <p>Configured certificates: ${data.certificates}</p>
-        <p>Healthy: ${data.healthy} | Errors: ${data.errors} | Unknown: ${data.unknown}</p>
-    `;
+    const container = document.getElementById('overview-content');
+    const statusLine = document.createElement('p');
+    const status = document.createElement('span');
+    status.className = statusClass(data.status);
+    status.textContent = data.status || 'Unknown';
+    statusLine.append('Status: ', status);
+
+    const counts = `Healthy: ${data.healthy} | Errors: ${data.errors} | Unknown: ${data.unknown} | Disabled: ${data.disabled || 0}`;
+    container.replaceChildren(statusLine);
+    appendParagraph(container, `Configured certificates: ${data.certificates}`);
+    appendParagraph(container, counts);
+}
+
+function createActionButton(label, className, certName, action) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = className;
+    button.textContent = label;
+    button.dataset.certName = certName;
+    button.dataset.action = action;
+    button.disabled = action === 'sync' && syncingCertificates.has(certName);
+    button.addEventListener('click', event => {
+        const target = event.currentTarget;
+        if (target.dataset.action === 'edit') {
+            editCert(target.dataset.certName);
+        } else {
+            syncCert(target.dataset.certName);
+        }
+    });
+    return button;
 }
 
 function renderCertificates(items) {
-    const el = document.getElementById('cert-list');
-    if (items.length === 0) {
-        el.innerHTML = '<p>No certificates configured.</p>';
+    const container = document.getElementById('cert-list');
+    if (!Array.isArray(items) || items.length === 0) {
+        const empty = document.createElement('p');
+        empty.textContent = 'No certificates configured.';
+        container.replaceChildren(empty);
         return;
     }
-    el.innerHTML = items.map(item => `
-        <div class="cert-card">
-            <h3>${escapeHtml(item.name)} <span class="status-${item.status.toLowerCase()}">${item.status}</span></h3>
-            <div class="cert-meta">
-                <p>${escapeHtml(item.common_name || 'No certificate loaded')}</p>
-                <p>Issuer: ${escapeHtml(item.issuer || 'N/A')}</p>
-                <p>Expires: ${item.expires ? formatDate(item.expires) : 'N/A'} (${item.days_remaining} days remaining)</p>
-                <p>Last sync: ${formatDate(item.last_successful_sync)}</p>
-                <p>Source fingerprint: ${formatFP(item.source_fingerprint)}</p>
-                <p>Certificate / key match: ${item.key_match ? 'Yes' : 'No'}</p>
-                <p>Auto Sync: ${item.auto_sync ? 'Enabled' : 'Disabled'}</p>
-                ${item.fallback ? `<p>Fallback: Enabled ${item.fallback_pending_restart ? '<span class="status-error">(restart Zoraxy to activate)</span>' : ''}</p>` : ''}
-                ${item.status === 'Error' ? `<p class="error-message">${escapeHtml(item.message)}</p>` : ''}
-            </div>
-            <div class="cert-actions">
-                <button class="btn btn-primary" onclick="editCert('${escapeHtml(item.name)}')">Edit</button>
-                <button class="btn" onclick="syncCert('${escapeHtml(item.name)}')">Sync Now</button>
-            </div>
-        </div>
-    `).join('');
+
+    const fragment = document.createDocumentFragment();
+    items.forEach(item => {
+        const card = document.createElement('div');
+        card.className = 'cert-card';
+        card.dataset.certName = item.name;
+
+        const heading = document.createElement('h3');
+        const status = document.createElement('span');
+        status.className = statusClass(item.status);
+        status.textContent = item.status || 'Unknown';
+        heading.append(document.createTextNode(`${item.name} `), status);
+        card.appendChild(heading);
+
+        const metadata = document.createElement('div');
+        metadata.className = 'cert-meta';
+        appendParagraph(metadata, item.common_name || 'No certificate loaded');
+        appendParagraph(metadata, `Issuer: ${item.issuer || 'N/A'}`);
+        appendParagraph(metadata, `Expires: ${item.expires ? formatDate(item.expires) : 'N/A'} (${item.days_remaining} days remaining)`);
+        appendParagraph(metadata, `Last sync: ${formatDate(item.last_successful_sync)}`);
+        appendParagraph(metadata, `Source fingerprint: ${formatFP(item.source_fingerprint)}`);
+        appendParagraph(metadata, `Certificate / key match: ${item.key_match ? 'Yes' : 'No'}`);
+        appendParagraph(metadata, `Enabled: ${item.enabled ? 'Yes' : 'No'}`);
+        appendParagraph(metadata, `Auto Sync: ${item.auto_sync ? 'Enabled' : 'Disabled'}`);
+        if (item.fallback) {
+            const fallback = appendParagraph(metadata, 'Fallback: Enabled');
+            if (item.fallback_pending_restart) {
+                const warning = document.createElement('span');
+                warning.className = 'status-error';
+                warning.textContent = ' (restart Zoraxy to activate)';
+                fallback.appendChild(warning);
+            }
+        }
+        if (item.status === 'Error') appendParagraph(metadata, item.message || 'Unknown error', 'error-message');
+        card.appendChild(metadata);
+
+        const actions = document.createElement('div');
+        actions.className = 'cert-actions';
+        actions.append(
+            createActionButton('Edit', 'btn btn-primary', item.name, 'edit'),
+            createActionButton('Sync Now', 'btn', item.name, 'sync')
+        );
+        card.appendChild(actions);
+        fragment.appendChild(card);
+    });
+    container.replaceChildren(fragment);
 }
 
-function escapeHtml(text) {
-    if (text == null) return '';
-    return text.toString()
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;')
-        .replace(/'/g, '&#039;');
+function showStatusError(message) {
+    const error = document.getElementById('status-error');
+    error.textContent = `Unable to refresh status: ${message}`;
+    error.classList.remove('hidden');
 }
 
-async function loadStatus() {
-    try {
-        const data = await fetchJSON(API.status);
-        renderOverview(data);
-        renderCertificates(data.items);
-    } catch (err) {
-        document.getElementById('overview-content').innerHTML = `<p class="error-message">${escapeHtml(err.message)}</p>`;
-        document.getElementById('cert-list').innerHTML = '';
+function clearStatusError() {
+    const error = document.getElementById('status-error');
+    error.textContent = '';
+    error.classList.add('hidden');
+}
+
+async function loadStatus(options = {}) {
+    if (statusRequest) {
+        if (!options.abortPrevious) return statusRequest.promise;
+        statusRequest.controller.abort();
     }
+
+    const controller = new AbortController();
+    const sequence = ++statusRequestSequence;
+    document.getElementById('btn-refresh').disabled = true;
+    const promise = (async () => {
+        try {
+            const data = await fetchJSON(API.status, { signal: controller.signal });
+            if (sequence !== statusRequestSequence) return;
+            renderOverview(data);
+            renderCertificates(data.items);
+            clearStatusError();
+        } catch (error) {
+            if (error.name !== 'AbortError' && sequence === statusRequestSequence) showStatusError(error.message);
+        } finally {
+            if (statusRequest && statusRequest.sequence === sequence) {
+                statusRequest = null;
+                document.getElementById('btn-refresh').disabled = false;
+            }
+        }
+    })();
+    statusRequest = { controller, promise, sequence };
+    return promise;
+}
+
+function setModalBusy(busy) {
+    modalOperationInFlight = busy;
+    modalActionButtons.forEach(id => {
+        document.getElementById(id).disabled = busy;
+    });
 }
 
 function openModal(cert) {
     currentCertName = cert ? cert.name : null;
     document.getElementById('modal-title').textContent = cert ? 'Edit Certificate' : 'Add Certificate';
     document.getElementById('cert-original-name').value = cert ? cert.name : '';
-    document.getElementById('cert-name').value = cert ? cert.name : '';
+    const nameInput = document.getElementById('cert-name');
+    nameInput.value = cert ? cert.name : '';
+    nameInput.readOnly = Boolean(cert);
+    document.getElementById('cert-enabled').checked = cert ? cert.enabled : true;
     document.getElementById('cert-source-cert').value = cert ? cert.source.certificate : '/cert_warden_plugin/certchain0.pem';
     document.getElementById('cert-source-key').value = cert ? cert.source.private_key : '/cert_warden_plugin/key0.pem';
     document.getElementById('cert-target-dir').value = cert ? cert.destination.target_directory : '/opt/zoraxy/config/conf/certs';
@@ -108,11 +211,15 @@ function openModal(cert) {
     document.getElementById('cert-poll-interval').value = cert ? cert.sync.poll_interval_seconds : 10;
     document.getElementById('cert-fallback').checked = cert ? cert.fallback : false;
     document.getElementById('btn-delete').style.display = cert ? 'inline-block' : 'none';
+    document.getElementById('btn-validate').style.display = cert ? 'inline-block' : 'none';
+    document.getElementById('btn-sync-now').style.display = cert ? 'inline-block' : 'none';
     document.getElementById('modal-message').classList.add('hidden');
+    setModalBusy(false);
     document.getElementById('modal').classList.remove('hidden');
 }
 
 function closeModal() {
+    if (modalOperationInFlight) return;
     document.getElementById('modal').classList.add('hidden');
     currentCertName = null;
 }
@@ -120,7 +227,7 @@ function closeModal() {
 function getFormCert() {
     return {
         name: document.getElementById('cert-name').value.trim(),
-        enabled: true,
+        enabled: document.getElementById('cert-enabled').checked,
         source: {
             certificate: document.getElementById('cert-source-cert').value.trim(),
             private_key: document.getElementById('cert-source-key').value.trim()
@@ -139,93 +246,131 @@ function getFormCert() {
 }
 
 function showModalMessage(text, isError) {
-    const el = document.getElementById('modal-message');
-    el.textContent = text;
-    el.classList.remove('hidden');
-    el.className = 'message ' + (isError ? 'error-message' : 'warning-message');
+    const message = document.getElementById('modal-message');
+    message.textContent = text;
+    message.className = `message ${isError ? 'error-message' : 'warning-message'}`;
 }
 
-async function saveCert(e) {
-    e.preventDefault();
+async function saveCert(event) {
+    event.preventDefault();
+    if (modalOperationInFlight) return;
+    const originalName = currentCertName;
     const cert = getFormCert();
+    setModalBusy(true);
     try {
-        if (currentCertName) {
-            await fetchJSON(`${API.certificates}/${encodeURIComponent(currentCertName)}`, {
-                method: 'PUT',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(cert)
-            });
-        } else {
-            await fetchJSON(API.certificates, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(cert)
-            });
-        }
+        await fetchJSON(originalName ? `${API.certificates}/${encodeURIComponent(originalName)}` : API.certificates, {
+            method: originalName ? 'PUT' : 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(cert)
+        });
+        setModalBusy(false);
         closeModal();
-        await loadStatus();
-    } catch (err) {
-        showModalMessage(err.message, true);
+        await loadStatus({ abortPrevious: true });
+    } catch (error) {
+        showModalMessage(error.message, true);
+        setModalBusy(false);
     }
 }
 
 async function deleteCert() {
-    if (!currentCertName) return;
-    if (!confirm(`Delete certificate "${currentCertName}"?`)) return;
+    if (!currentCertName || modalOperationInFlight) return;
+    const name = currentCertName;
+    if (!confirm(`Delete certificate "${name}"?`)) return;
+    setModalBusy(true);
     try {
-        await fetchJSON(`${API.certificates}/${encodeURIComponent(currentCertName)}`, {
-            method: 'DELETE'
-        });
+        await fetchJSON(`${API.certificates}/${encodeURIComponent(name)}`, { method: 'DELETE' });
+        setModalBusy(false);
         closeModal();
-        await loadStatus();
-    } catch (err) {
-        showModalMessage(err.message, true);
+        await loadStatus({ abortPrevious: true });
+    } catch (error) {
+        showModalMessage(error.message, true);
+        setModalBusy(false);
     }
 }
 
-async function syncCert(name) {
+function updateSyncButtons(name, disabled) {
+    document.querySelectorAll('button[data-action="sync"]').forEach(button => {
+        if (button.dataset.certName === name) button.disabled = disabled;
+    });
+}
+
+async function syncCert(name, reportError = message => alert(message)) {
+    if (!name || syncingCertificates.has(name)) return false;
+    syncingCertificates.add(name);
+    updateSyncButtons(name, true);
     try {
-        await fetchJSON(`${API.certificates}/${encodeURIComponent(name)}/sync`, {
-            method: 'POST'
-        });
-        await loadStatus();
-    } catch (err) {
-        alert(err.message);
+        await fetchJSON(`${API.certificates}/${encodeURIComponent(name)}/sync`, { method: 'POST' });
+        await loadStatus({ abortPrevious: true });
+        return true;
+    } catch (error) {
+        reportError(error.message);
+        return false;
+    } finally {
+        syncingCertificates.delete(name);
+        updateSyncButtons(name, false);
     }
+}
+
+async function syncCurrentCert() {
+    if (!currentCertName || modalOperationInFlight) return;
+    setModalBusy(true);
+    await syncCert(currentCertName, message => showModalMessage(message, true));
+    setModalBusy(false);
 }
 
 async function validateCert() {
-    if (!currentCertName) return;
+    if (!currentCertName || modalOperationInFlight) return;
+    const name = currentCertName;
+    setModalBusy(true);
     try {
-        await fetchJSON(`${API.certificates}/${encodeURIComponent(currentCertName)}/validate`, {
-            method: 'POST'
-        });
+        await fetchJSON(`${API.certificates}/${encodeURIComponent(name)}/validate`, { method: 'POST' });
         showModalMessage('Certificate is valid', false);
-        await loadStatus();
-    } catch (err) {
-        showModalMessage(err.message, true);
+        await loadStatus({ abortPrevious: true });
+    } catch (error) {
+        showModalMessage(error.message, true);
+    } finally {
+        setModalBusy(false);
     }
 }
 
 async function editCert(name) {
     try {
-        const certs = await fetchJSON(API.certificates);
-        const cert = certs.find(c => c.name === name);
+        const certificates = await fetchJSON(API.certificates);
+        const cert = certificates.find(item => item.name === name);
         if (cert) openModal(cert);
-    } catch (err) {
-        alert(err.message);
+    } catch (error) {
+        alert(error.message);
     }
 }
 
-document.getElementById('btn-refresh').addEventListener('click', loadStatus);
+function scheduleStatusPoll(delay = POLL_INTERVAL_MS) {
+    clearTimeout(statusTimer);
+    if (document.hidden) return;
+    statusTimer = setTimeout(runStatusPoll, delay);
+}
+
+async function runStatusPoll() {
+    await loadStatus();
+    // A mutation may replace an in-flight poll. Wait for the newest request
+    // before starting the interval so polling can never overlap.
+    while (statusRequest) await statusRequest.promise;
+    scheduleStatusPoll();
+}
+
+document.getElementById('btn-refresh').addEventListener('click', () => loadStatus());
 document.getElementById('btn-add').addEventListener('click', () => openModal(null));
 document.querySelector('.close').addEventListener('click', closeModal);
 document.getElementById('cert-form').addEventListener('submit', saveCert);
 document.getElementById('btn-delete').addEventListener('click', deleteCert);
-document.getElementById('btn-sync-now').addEventListener('click', () => {
-    if (currentCertName) syncCert(currentCertName);
-});
+document.getElementById('btn-sync-now').addEventListener('click', syncCurrentCert);
 document.getElementById('btn-validate').addEventListener('click', validateCert);
+document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+        clearTimeout(statusTimer);
+        if (statusRequest) statusRequest.controller.abort();
+    } else {
+        scheduleStatusPoll(0);
+    }
+});
 
-loadStatus();
-setInterval(loadStatus, 10000);
+runStatusPoll();
