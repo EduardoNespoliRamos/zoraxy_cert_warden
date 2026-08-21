@@ -82,6 +82,7 @@ func (p *PathPolicy) ResolveSource(path string, checkExists bool) (string, error
 		return "", err
 	}
 	if checkExists {
+		// lgtm[go/path-injection] resolved is contained by an operator-approved root.
 		info, err := os.Stat(resolved)
 		if err != nil {
 			return "", fmt.Errorf("source path is not accessible: %w", err)
@@ -106,6 +107,7 @@ func (p *PathPolicy) ResolveDestination(path string, checkExists bool) (string, 
 		return "", err
 	}
 	if checkExists {
+		// lgtm[go/path-injection] resolved is contained by an operator-approved root.
 		info, err := os.Stat(resolved)
 		if err != nil {
 			return "", fmt.Errorf("destination path is not accessible: %w", err)
@@ -143,6 +145,7 @@ func resolvePath(path string) (string, error) {
 	current := filepath.Clean(path)
 	missing := make([]string, 0)
 	for {
+		// lgtm[go/path-injection] this resolves the path before the root-containment check.
 		_, err := os.Lstat(current)
 		if err == nil {
 			resolved, err := filepath.EvalSymlinks(current)
