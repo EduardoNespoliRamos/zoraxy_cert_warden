@@ -214,6 +214,35 @@ Generate local test certificates:
 ./scripts/generate-test-cert.sh ./tmp/test-certs
 ```
 
+## Release process
+
+This project follows a Git Flow-inspired release process:
+
+1. Create a release or hotfix branch from `main`:
+
+   ```bash
+   git checkout -b release/0.0.1
+   ```
+
+2. Make the necessary changes and push the branch.
+
+3. Open a Pull Request from the release/hotfix branch to `main`.
+   Only branches matching `release/X.Y.Z` or `hotfix/X.Y.Z` are allowed.
+
+4. After the PR is reviewed and merged, GitHub Actions automatically:
+
+   - Validates the source branch name.
+   - Runs the full test suite (unit tests, E2E tests, and the integration
+     matrix).
+   - Creates a tag `vX.Y.Z` from the branch name.
+   - Triggers `release.yml` to build the binaries, generate `SHA256SUMS`, and
+     publish a GitHub Release.
+
+5. Attach release notes or a manual changelog if needed.
+
+Manual tags matching `v*.*.*` still trigger `release.yml` for backwards
+compatibility, but prefer the automated flow above.
+
 ## CI / CD
 
 This repository uses GitHub Actions. See `.github/workflows/`.

@@ -123,12 +123,47 @@ When changing the web UI or API, keep these constraints in mind:
 
 ## Release process
 
-1. Ensure all tests pass on `main`.
-2. Create and push a tag: `git tag v1.0.0 && git push origin v1.0.0`.
-3. The `release.yml` workflow builds `linux/amd64` and `linux/arm64` binaries,
-   generates `SHA256SUMS`, and creates a GitHub Release with auto-generated
-   release notes.
-4. Attach release notes or manual changelog items if needed.
+This repository uses a Git Flow-inspired release process. Only branches matching
+`release/X.Y.Z` or `hotfix/X.Y.Z` can be merged into `main`, and only through a
+Pull Request.
+
+1. Create a release or hotfix branch from `main`:
+
+   ```bash
+   git checkout -b release/0.0.1
+   ```
+
+2. Apply the release changes and open a Pull Request to `main`.
+
+3. After the PR is merged, GitHub Actions (`tag-on-merge.yml`) automatically:
+
+   - Identifies the merged release/hotfix branch.
+   - Extracts the version from the branch name.
+   - Runs the full test suite (unit tests, E2E tests, and the integration
+     matrix).
+   - Creates and pushes a tag `vX.Y.Z`.
+
+4. The `release.yml` workflow detects the new tag, builds `linux/amd64` and
+   `linux/arm64` binaries, generates `SHA256SUMS`, and creates a GitHub Release
+   with auto-generated release notes.
+
+5. Attach release notes or a manual changelog if needed.
+
+Manual tags matching `v*.*.*` still work for backwards compatibility, but prefer
+the automated flow.
+
+### Branch protection
+
+The `main` branch is protected by a GitHub branch protection rule applied via
+`scripts/configure-branch-protection.sh`. It requires:
+
+- Pull Request reviews (including code owner review).
+- Status checks to pass.
+- Up-to-date branches before merging.
+- Resolved conversations.
+- Only the repository owner can push/merge to `main`.
+
+Administrators can bypass these settings if needed.
 
 ## Common tasks for agents
 
