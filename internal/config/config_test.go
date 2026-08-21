@@ -73,7 +73,7 @@ func TestConfigCloneIsDeep(t *testing.T) {
 func TestConfigValidateDoesNotMutate(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.LogLevel = " INFO "
-	cfg.Certificates[0].Name = " homealone-wildcard "
+	cfg.Certificates[0].Name = " example-certificate "
 	cfg.Certificates[0].Source.Certificate = " " + cfg.Certificates[0].Source.Certificate + " "
 	cfg.Certificates[0].Destination.TargetDirectory = " /tmp "
 	cfg.Certificates[0].Sync.PollIntervalSeconds = 0
@@ -91,7 +91,7 @@ func TestConfigSaveNormalizesCloneWithoutMutatingCaller(t *testing.T) {
 	dir := t.TempDir()
 	cfg := DefaultConfig()
 	cfg.LogLevel = ""
-	cfg.Certificates[0].Name = " homealone-wildcard "
+	cfg.Certificates[0].Name = " example-certificate "
 	cfg.Certificates[0].Source.Certificate = " " + cfg.Certificates[0].Source.Certificate + " "
 	cfg.Certificates[0].Destination.TargetDirectory = " " + dir + " "
 	cfg.Certificates[0].Sync.PollIntervalSeconds = 0
@@ -108,7 +108,7 @@ func TestConfigSaveNormalizesCloneWithoutMutatingCaller(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load failed: %v", err)
 	}
-	if loaded.LogLevel != "info" || loaded.Certificates[0].Name != "homealone-wildcard" {
+	if loaded.LogLevel != "info" || loaded.Certificates[0].Name != "example-certificate" {
 		t.Fatalf("saved config was not normalized: %#v", loaded)
 	}
 	if loaded.Certificates[0].Sync.PollIntervalSeconds != DefaultPollInterval {

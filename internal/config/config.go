@@ -61,7 +61,7 @@ func DefaultConfig() *Config {
 		LogLevel: "info",
 		Certificates: []CertificateConfig{
 			{
-				Name:    "homealone-wildcard",
+				Name:    "example-certificate",
 				Enabled: true,
 				Source: CertificateSource{
 					Certificate: DefaultSourceCertificate,
@@ -69,7 +69,7 @@ func DefaultConfig() *Config {
 				},
 				Destination: CertificateDestination{
 					TargetDirectory: DefaultTargetDirectory,
-					TargetName:      "homealone-wildcard",
+					TargetName:      "example-certificate",
 				},
 				Sync: SyncConfig{
 					AutoSync:            true,

@@ -14,7 +14,7 @@ cat > ./tmp/plugin/config.json <<EOF
 {
   "certificates": [
     {
-      "name": "homealone-wildcard",
+      "name": "example-certificate",
       "enabled": true,
       "source": {
         "certificate": "$ROOT/tmp/test-certs/certchain0.pem",
@@ -22,7 +22,7 @@ cat > ./tmp/plugin/config.json <<EOF
       },
       "destination": {
         "target_directory": "$ROOT/tmp/target",
-        "target_name": "homealone-wildcard"
+        "target_name": "example-certificate"
       },
       "sync": {
         "auto_sync": true,

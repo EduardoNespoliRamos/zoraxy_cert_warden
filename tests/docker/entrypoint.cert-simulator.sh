@@ -2,7 +2,7 @@
 set -e
 
 OUTDIR="${CERT_DIR:-/certs}"
-CN="${CERT_CN:-*.homealone.com.br}"
+CN="${CERT_CN:-example.com}"
 mkdir -p "$OUTDIR"
 
 generate() {

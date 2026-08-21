@@ -290,7 +290,7 @@ func TestAtomicWriteRejectsDestinationOutsidePolicy(t *testing.T) {
 func TestEnsureFallback(t *testing.T) {
 	dir := t.TempDir()
 	policy := syncTestPolicy(t, dir, dir)
-	desired := "homealone-wildcard"
+	desired := "example-certificate"
 	changed, err := EnsureFallback(dir, &desired, policy)
 	if err != nil || !changed {
 		t.Fatal(err)
@@ -311,7 +311,7 @@ func TestEnsureFallback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if name != "homealone-wildcard" {
+	if name != "example-certificate" {
 		t.Fatalf("unexpected fallback name: %s", name)
 	}
 	changed, err = EnsureFallback(dir, nil, policy)
