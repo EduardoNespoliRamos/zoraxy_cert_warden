@@ -31,12 +31,18 @@ for BRANCH in "${BRANCHES[@]}"; do
 
   echo "Configuring branch protection rules for ${REPO}#${BRANCH}..."
 
+  STRICT=true
+  if [[ "$BRANCH" == "develop" ]]; then
+    # Backmerge PRs must not require merging develop changes into main first.
+    STRICT=false
+  fi
+
   gh api "repos/${REPO}/branches/${BRANCH}/protection" \
     --method PUT \
     --input - <<EOF
 {
   "required_status_checks": {
-    "strict": true,
+    "strict": ${STRICT},
     "contexts": [
       "Validate source branch",
       "quality / Quality gates",

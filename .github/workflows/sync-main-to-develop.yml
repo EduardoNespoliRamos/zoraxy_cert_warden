@@ -1,0 +1,49 @@
+name: Sync Main to Develop
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: sync-main-to-develop
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Validate source branch
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create or reuse synchronization pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          AHEAD=$(gh api "repos/${GITHUB_REPOSITORY}/compare/develop...main" --jq '.ahead_by')
+          if [[ "$AHEAD" -eq 0 ]]; then
+            echo "develop already contains every commit from main."
+            exit 0
+          fi
+
+          PR_NUMBER=$(gh pr list \
+            --repo "$GITHUB_REPOSITORY" \
+            --base develop \
+            --head main \
+            --state open \
+            --json number \
+            --jq '.[0].number // empty')
+
+          if [[ -n "$PR_NUMBER" ]]; then
+            echo "Synchronization pull request #${PR_NUMBER} is already open."
+            exit 0
+          fi
+
+          gh pr create \
+            --repo "$GITHUB_REPOSITORY" \
+            --base develop \
+            --head main \
+            --title "chore: sync main into develop" \
+            --body "Automated backmerge of production changes from \`main\` into \`develop\`."
