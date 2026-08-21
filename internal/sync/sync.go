@@ -22,12 +22,14 @@ const (
 
 // Result describes the outcome of a sync attempt.
 type Result struct {
-	Synced    bool
-	NoChanges bool
-	SourceFP  string
-	DestFP    string
-	Fallback  bool
-	Error     error
+	Synced             bool
+	NoChanges          bool
+	SourceFP           string
+	DestFP             string
+	SourceBundleDigest string
+	DestBundleDigest   string
+	Fallback           bool
+	Error              error
 }
 
 type syncFile interface {
@@ -101,12 +103,14 @@ func Sync(cfg config.CertificateConfig, policy *config.PathPolicy) (*certutil.Ce
 		return nil, res, err
 	}
 	res.SourceFP = certInfo.Fingerprint
+	res.SourceBundleDigest = certInfo.BundleDigest
 
 	destDir := cfg.Destination.TargetDirectory
 	destName := cfg.Destination.TargetName
 	destInfo, destErr := readDestinationPair(destDir, destName, policy, osFilesystem)
 	if destErr == nil {
 		res.DestFP = destInfo.Fingerprint
+		res.DestBundleDigest = destInfo.BundleDigest
 		if destInfo.BundleDigest == certInfo.BundleDigest {
 			res.NoChanges = true
 			if cfg.Fallback {
@@ -126,6 +130,7 @@ func Sync(cfg config.CertificateConfig, policy *config.PathPolicy) (*certutil.Ce
 	}
 	res.Synced = true
 	res.DestFP = certInfo.Fingerprint
+	res.DestBundleDigest = certInfo.BundleDigest
 
 	if cfg.Fallback {
 		if err := WriteFallback(destDir, destName, policy); err != nil {
@@ -399,11 +404,16 @@ func wrapPathError(operation string, err error) error {
 
 // ReadDestinationFingerprint reads the validated destination pair's leaf fingerprint.
 func ReadDestinationFingerprint(destDir, destName string, policy *config.PathPolicy) (string, error) {
-	info, err := readDestinationPair(destDir, destName, policy, osFilesystem)
+	info, err := ReadDestinationInfo(destDir, destName, policy)
 	if err != nil {
 		return "", err
 	}
 	return info.Fingerprint, nil
+}
+
+// ReadDestinationInfo validates and describes the complete destination pair.
+func ReadDestinationInfo(destDir, destName string, policy *config.PathPolicy) (*certutil.CertInfo, error) {
+	return readDestinationPair(destDir, destName, policy, osFilesystem)
 }
 
 // WriteFallback writes the fallback.json file used by Zoraxy.

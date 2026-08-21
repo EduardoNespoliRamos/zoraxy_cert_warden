@@ -2,79 +2,66 @@ package web
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/eduardoramos/zoraxy-cert-warden/internal/config"
 	"github.com/eduardoramos/zoraxy-cert-warden/internal/status"
 )
 
-type testSyncer struct {
-	reloads int
+type testManager struct {
+	mu  sync.Mutex
+	cfg *config.Config
 }
 
-func (s *testSyncer) SyncCertificate(string) error     { return nil }
-func (s *testSyncer) ValidateCertificate(string) error { return nil }
-func (s *testSyncer) ReloadConfig(*config.Config) error {
-	s.reloads++
+func (m *testManager) SnapshotConfig() *config.Config {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.cfg.Clone()
+}
+func (m *testManager) SnapshotStatus() []status.CertificateStatus { return nil }
+func (m *testManager) ApplyConfig(_ context.Context, candidate *config.Config) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.cfg = candidate.Clone()
 	return nil
 }
-
-func TestHandleCertificatesRejectsOutOfPolicyPath(t *testing.T) {
-	sourceRoot := t.TempDir()
-	destinationRoot := t.TempDir()
-	policy, err := config.NewPathPolicy([]string{sourceRoot}, []string{destinationRoot})
-	if err != nil {
-		t.Fatal(err)
+func (m *testManager) MutateConfig(_ context.Context, mutation ConfigMutation) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	candidate := m.cfg.Clone()
+	if err := mutation(candidate); err != nil {
+		return err
 	}
+	m.cfg = candidate
+	return nil
+}
+func (m *testManager) SyncCertificate(string) error     { return nil }
+func (m *testManager) ValidateCertificate(string) error { return nil }
 
-	cfg := &config.Config{Certificates: []config.CertificateConfig{{
-		Name:    "existing",
-		Enabled: true,
-		Source: config.CertificateSource{
-			Certificate: filepath.Join(sourceRoot, "cert.pem"),
-			PrivateKey:  filepath.Join(sourceRoot, "key.pem"),
-		},
-		Destination: config.CertificateDestination{
-			TargetDirectory: destinationRoot,
-			TargetName:      "existing",
-		},
-	}}}
-	syncer := &testSyncer{}
-	server := NewServer(cfg, map[string]*status.State{}, syncer, filepath.Join(t.TempDir(), "config.json"), policy)
-
-	outside := t.TempDir()
-	requestConfig := config.CertificateConfig{
-		Name:    "outside",
-		Enabled: true,
-		Source: config.CertificateSource{
-			Certificate: filepath.Join(outside, "cert.pem"),
-			PrivateKey:  filepath.Join(outside, "key.pem"),
-		},
-		Destination: config.CertificateDestination{
-			TargetDirectory: destinationRoot,
-			TargetName:      "outside",
-		},
+func TestConcurrentCertificateCreatesDoNotLoseUpdates(t *testing.T) {
+	manager := &testManager{cfg: &config.Config{LogLevel: "info"}}
+	server := NewServer(manager)
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			body, _ := json.Marshal(config.CertificateConfig{Name: fmt.Sprintf("cert-%d", i)})
+			response := httptest.NewRecorder()
+			server.handleCertificates(response, httptest.NewRequest(http.MethodPost, "/api/certificates", bytes.NewReader(body)))
+			if response.Code != http.StatusOK {
+				t.Errorf("create failed: %d: %s", response.Code, response.Body.String())
+			}
+		}(i)
 	}
-	body, err := json.Marshal(requestConfig)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req := httptest.NewRequest(http.MethodPost, "/api/certificates", bytes.NewReader(body))
-	response := httptest.NewRecorder()
-
-	server.handleCertificates(response, req)
-
-	if response.Code != http.StatusBadRequest {
-		t.Fatalf("expected status 400, got %d: %s", response.Code, response.Body.String())
-	}
-	if syncer.reloads != 0 {
-		t.Fatal("out-of-policy config must not be reloaded")
-	}
-	if len(cfg.Certificates) != 1 {
-		t.Fatal("out-of-policy config must not be persisted in memory")
+	wg.Wait()
+	if got := len(manager.SnapshotConfig().Certificates); got != 20 {
+		t.Fatalf("expected 20 certificates, got %d", got)
 	}
 }

@@ -1,12 +1,14 @@
 package main
 
 import (
+	"context"
 	"embed"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -33,14 +35,37 @@ const (
 var content embed.FS
 
 type manager struct {
-	mu         sync.RWMutex
+	mu         sync.RWMutex // protects only active snapshots and runtime handles
+	applyMu    sync.Mutex
 	cfg        *config.Config
 	states     map[string]*status.State
-	watchers   map[string]*watcher.Watcher
+	watchers   map[string]managedWatcher
+	generation uint64
 	configPath string
 	logger     *slog.Logger
 	policy     *config.PathPolicy
+
+	destinationMu    sync.Mutex
+	destinationLocks map[string]*sync.Mutex
+	defaultsOnce     sync.Once
+
+	saveConfig          func(*config.Config, string, *config.PathPolicy) error
+	watcherFactory      func([]string, time.Duration, time.Duration, bool, func(), *config.PathPolicy) (managedWatcher, error)
+	syncFunc            func(config.CertificateConfig, *config.PathPolicy) (*certutil.CertInfo, *certSync.Result, error)
+	validateFunc        func(string, string) (*certutil.CertInfo, error)
+	readDestinationFunc func(string, string, *config.PathPolicy) (*certutil.CertInfo, error)
 }
+
+type managedWatcher interface {
+	Start() error
+	Stop()
+}
+
+type configValidationError struct{ err error }
+
+func (e configValidationError) Error() string       { return e.err.Error() }
+func (e configValidationError) Unwrap() error       { return e.err }
+func (e configValidationError) InvalidConfig() bool { return true }
 
 func main() {
 	runtimeCfg, err := plugin.ServeAndRecvSpec(pluginSpec())
@@ -72,21 +97,21 @@ func main() {
 	}
 
 	m := &manager{
-		cfg:        cfg,
+		cfg:        &config.Config{LogLevel: "info"},
 		states:     make(map[string]*status.State),
-		watchers:   make(map[string]*watcher.Watcher),
+		watchers:   make(map[string]managedWatcher),
 		configPath: configPath,
 		logger:     logger,
 		policy:     policy,
 	}
 
-	if err := m.ReloadConfig(cfg); err != nil {
+	if err := m.ApplyConfig(context.Background(), cfg); err != nil {
 		logger.Error("failed to initialize config", "error", err)
 		os.Exit(1)
 	}
 
 	mux := http.NewServeMux()
-	server := web.NewServer(cfg, m.states, m, configPath, policy)
+	server := web.NewServer(m)
 	server.RegisterRoutes(mux, uiPath)
 
 	embedWebRouter := plugin.NewPluginEmbedUIRouter(pluginID, &content, webRoot, uiPath)
@@ -125,158 +150,334 @@ func pluginSpec() *plugin.IntroSpect {
 	}
 }
 
-func (m *manager) ReloadConfig(cfg *config.Config) error {
-	stagedCfg := *cfg
-	stagedCfg.Certificates = append([]config.CertificateConfig(nil), cfg.Certificates...)
-	if err := stagedCfg.Validate(false, m.policy); err != nil {
+func (m *manager) defaults() {
+	m.defaultsOnce.Do(func() {
+		if m.logger == nil {
+			m.logger = slog.Default()
+		}
+		if m.saveConfig == nil {
+			m.saveConfig = func(cfg *config.Config, path string, policy *config.PathPolicy) error {
+				return cfg.Save(path, policy)
+			}
+		}
+		if m.watcherFactory == nil {
+			m.watcherFactory = func(paths []string, poll, debounce time.Duration, fsnotify bool, callback func(), policy *config.PathPolicy) (managedWatcher, error) {
+				return watcher.New(paths, poll, debounce, fsnotify, callback, policy)
+			}
+		}
+		if m.syncFunc == nil {
+			m.syncFunc = certSync.Sync
+		}
+		if m.validateFunc == nil {
+			m.validateFunc = certutil.LoadAndValidate
+		}
+		if m.readDestinationFunc == nil {
+			m.readDestinationFunc = certSync.ReadDestinationInfo
+		}
+	})
+}
+
+// SnapshotConfig returns a deep copy detached from manager-owned memory.
+func (m *manager) SnapshotConfig() *config.Config {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.cfg == nil {
+		return &config.Config{}
+	}
+	return m.cfg.Clone()
+}
+
+// SnapshotStatus returns immutable status values in certificate-name order.
+func (m *manager) SnapshotStatus() []status.CertificateStatus {
+	m.mu.RLock()
+	items := make([]status.CertificateStatus, 0, len(m.states))
+	for _, state := range m.states {
+		items = append(items, state.ToCertificateStatus())
+	}
+	m.mu.RUnlock()
+	sort.Slice(items, func(i, j int) bool { return items[i].Name < items[j].Name })
+	return items
+}
+
+// ApplyConfig serializes preparation, persistence, and activation. No active
+// state changes until every new watcher has started and persistence succeeds.
+func (m *manager) ApplyConfig(ctx context.Context, candidate *config.Config) error {
+	m.applyMu.Lock()
+	defer m.applyMu.Unlock()
+	return m.applyConfigLocked(ctx, candidate)
+}
+
+// MutateConfig creates its candidate after entering the apply serialization,
+// preventing read-modify-write updates from losing concurrent changes.
+func (m *manager) MutateConfig(ctx context.Context, mutation web.ConfigMutation) error {
+	m.applyMu.Lock()
+	defer m.applyMu.Unlock()
+	if err := ctx.Err(); err != nil {
 		return err
 	}
-	cfg = &stagedCfg
+	candidate := m.SnapshotConfig()
+	if err := mutation(candidate); err != nil {
+		return err
+	}
+	return m.applyConfigLocked(ctx, candidate)
+}
 
-	newStates := make(map[string]*status.State, len(cfg.Certificates))
-	newWatchers := make(map[string]*watcher.Watcher)
-	for _, certCfg := range cfg.Certificates {
+// ReloadConfig remains the non-HTTP compatibility entry point.
+func (m *manager) ReloadConfig(cfg *config.Config) error {
+	return m.ApplyConfig(context.Background(), cfg)
+}
+
+func (m *manager) applyConfigLocked(ctx context.Context, candidate *config.Config) error {
+	m.defaults()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	staged := candidate.Clone()
+	if staged == nil {
+		return configValidationError{err: fmt.Errorf("configuration is required")}
+	}
+	staged.Normalize()
+	if err := staged.Validate(false, m.policy); err != nil {
+		return configValidationError{err: err}
+	}
+
+	m.mu.RLock()
+	generation := m.generation + 1
+	m.mu.RUnlock()
+	newStates := make(map[string]*status.State, len(staged.Certificates))
+	newWatchers := make(map[string]managedWatcher)
+	for _, certCfg := range staged.Certificates {
 		newStates[certCfg.Name] = &status.State{Config: certCfg}
 		if !certCfg.Enabled || !certCfg.Sync.AutoSync {
 			continue
 		}
-		paths := []string{certCfg.Source.Certificate, certCfg.Source.PrivateKey}
-		poll := time.Duration(certCfg.Sync.PollIntervalSeconds) * time.Second
-		if poll < time.Second {
-			poll = time.Second
-		}
 		name := certCfg.Name
-		w, err := watcher.New(paths, poll, 2*time.Second, certCfg.Sync.FilesystemWatch, func() {
-			m.SyncCertificate(name)
-		}, m.policy)
+		watch, err := m.watcherFactory(
+			[]string{certCfg.Source.Certificate, certCfg.Source.PrivateKey},
+			time.Duration(certCfg.Sync.PollIntervalSeconds)*time.Second,
+			2*time.Second, certCfg.Sync.FilesystemWatch,
+			func() { _ = m.syncGeneration(name, generation) }, m.policy,
+		)
 		if err != nil {
+			stopWatchers(newWatchers)
 			return err
 		}
-		newWatchers[name] = w
+		newWatchers[name] = watch
+	}
+
+	for _, watch := range newWatchers {
+		if err := watch.Start(); err != nil {
+			stopWatchers(newWatchers)
+			return err
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		stopWatchers(newWatchers)
+		return err
+	}
+	if err := m.saveConfig(staged, m.configPath, m.policy); err != nil {
+		stopWatchers(newWatchers)
+		return err
 	}
 
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	m.stopWatchersLocked()
-	m.cfg = cfg
+	oldWatchers := m.watchers
+	m.cfg = staged
 	m.states = newStates
 	m.watchers = newWatchers
+	m.generation = generation
+	m.mu.Unlock()
 
-	for _, certCfg := range cfg.Certificates {
+	stopWatchers(oldWatchers)
+	for _, certCfg := range staged.Certificates {
 		if certCfg.Enabled {
-			m.syncOneLocked(certCfg.Name)
-		}
-		if w, ok := m.watchers[certCfg.Name]; ok {
-			if err := w.Start(); err != nil {
-				m.logger.Error("failed to start watcher", "certificate", certCfg.Name, "error", err)
-			}
+			_ = m.syncGeneration(certCfg.Name, generation)
 		}
 	}
 	return nil
 }
 
 func (m *manager) SyncCertificate(name string) error {
+	m.mu.RLock()
+	generation := m.generation
+	m.mu.RUnlock()
+	return m.syncGeneration(name, generation)
+}
+
+func (m *manager) syncGeneration(name string, generation uint64) error {
+	m.defaults()
+	m.mu.RLock()
+	state, ok := m.states[name]
+	activeGeneration := m.generation
+	if !ok || activeGeneration != generation {
+		m.mu.RUnlock()
+		if !ok && activeGeneration == generation {
+			return fmt.Errorf("certificate not found")
+		}
+		return nil
+	}
+	cfg := state.Config
+	m.mu.RUnlock()
+
+	destination, err := m.policy.ResolveDestination(cfg.Destination.TargetDirectory, false)
+	if err != nil {
+		m.recordSync(name, generation, nil, nil, time.Time{}, nil, err, false, err)
+		return err
+	}
+	lock := m.destinationLock(filepath.Join(destination, cfg.Destination.TargetName))
+	lock.Lock()
+	defer lock.Unlock()
+	if !m.isGenerationActive(name, generation) {
+		return nil
+	}
+
+	info, result, syncErr := m.syncFunc(cfg, m.policy)
+	var modified time.Time
+	if sourcePath, resolveErr := m.policy.ResolveSource(cfg.Source.Certificate, true); resolveErr == nil {
+		if fileInfo, statErr := os.Stat(sourcePath); statErr == nil {
+			modified = fileInfo.ModTime()
+		}
+	}
+	var destinationInfo *certutil.CertInfo
+	var destinationErr error
+	if info != nil {
+		destinationInfo, destinationErr = m.readDestinationFunc(
+			cfg.Destination.TargetDirectory, cfg.Destination.TargetName, m.policy,
+		)
+	}
+	fallbackPending := false
+	if syncErr == nil && cfg.Fallback {
+		currentFallback, fallbackErr := certSync.ReadFallback(cfg.Destination.TargetDirectory, m.policy)
+		fallbackPending = fallbackErr != nil || currentFallback != cfg.Destination.TargetName
+	}
+	m.recordSync(name, generation, info, result, modified, destinationInfo, destinationErr, fallbackPending, syncErr)
+	if syncErr != nil {
+		m.logger.Error("cert-sync failed", "certificate", name, "error", syncErr)
+	}
+	return syncErr
+}
+
+func (m *manager) recordSync(name string, generation uint64, info *certutil.CertInfo, result *certSync.Result, modified time.Time, destinationInfo *certutil.CertInfo, destinationErr error, fallbackPending bool, syncErr error) {
+	now := time.Now()
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.syncOneLocked(name)
+	state, ok := m.states[name]
+	if !ok || m.generation != generation {
+		return
+	}
+	state.LastAttemptedSync = &now
+	state.LastSourceModification = modified
+	state.SyncError = syncErr
+	state.SourceInfo = info
+	if info == nil {
+		if destinationErr != nil {
+			state.LastDestinationValidation = &now
+			state.DestinationValidationError = destinationErr
+			return
+		}
+		state.LastSourceValidation = &now
+		state.SourceValidationError = syncErr
+		return
+	}
+	state.LastSourceValidation = &now
+	state.SourceValidationError = nil
+	state.SourceFingerprint = info.Fingerprint
+	state.SourceDigest = info.BundleDigest
+	state.LastDestinationValidation = &now
+	state.DestinationValidationError = destinationErr
+	if destinationErr == nil {
+		state.DestinationDigest = destinationInfo.BundleDigest
+		state.DestinationFingerprint = destinationInfo.Fingerprint
+	}
+	if syncErr != nil || result == nil {
+		return
+	}
+	state.LastSuccessfulSync = &now
+	if state.DestinationDigest == "" {
+		state.DestinationDigest = result.DestBundleDigest
+	}
+	if state.DestinationFingerprint == "" {
+		state.DestinationFingerprint = result.DestFP
+	}
+	state.FallbackPendingRestart = state.Config.Fallback && fallbackPending
 }
 
 func (m *manager) ValidateCertificate(name string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	st, ok := m.states[name]
+	m.defaults()
+	m.mu.RLock()
+	state, ok := m.states[name]
+	generation := m.generation
 	if !ok {
+		m.mu.RUnlock()
 		return fmt.Errorf("certificate not found")
 	}
-	now := time.Now()
-	st.LastAttemptedSync = &now
-	certPath, err := m.policy.ResolveSource(st.Config.Source.Certificate, true)
-	if err != nil {
-		st.LastError = err
-		return err
+	cfg := state.Config
+	m.mu.RUnlock()
+
+	certPath, err := m.policy.ResolveSource(cfg.Source.Certificate, true)
+	if err == nil {
+		var keyPath string
+		keyPath, err = m.policy.ResolveSource(cfg.Source.PrivateKey, true)
+		if err == nil {
+			var info *certutil.CertInfo
+			info, err = m.validateFunc(certPath, keyPath)
+			m.recordValidation(name, generation, info, err)
+			return err
+		}
 	}
-	keyPath, err := m.policy.ResolveSource(st.Config.Source.PrivateKey, true)
-	if err != nil {
-		st.LastError = err
-		return err
-	}
-	certInfo, err := certutil.LoadAndValidate(certPath, keyPath)
-	st.SourceInfo = certInfo
-	if err != nil {
-		st.LastError = err
-		return err
-	}
-	st.LastError = nil
-	return nil
+	m.recordValidation(name, generation, nil, err)
+	return err
 }
 
-func (m *manager) syncOneLocked(name string) error {
-	st, ok := m.states[name]
-	if !ok {
-		return fmt.Errorf("certificate not found")
-	}
+func (m *manager) recordValidation(name string, generation uint64, info *certutil.CertInfo, validationErr error) {
 	now := time.Now()
-	st.LastAttemptedSync = &now
-
-	certInfo, result, err := certSync.Sync(st.Config, m.policy)
-	st.SourceInfo = certInfo
-
-	var info os.FileInfo
-	var errStat error
-	if sourcePath, policyErr := m.policy.ResolveSource(st.Config.Source.Certificate, true); policyErr == nil {
-		info, errStat = os.Stat(sourcePath)
-	} else {
-		errStat = policyErr
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	state, ok := m.states[name]
+	if !ok || m.generation != generation {
+		return
 	}
-	if errStat == nil {
-		st.LastSourceModification = info.ModTime()
+	state.LastSourceValidation = &now
+	state.SourceValidationError = validationErr
+	state.SourceInfo = info
+	if info != nil {
+		state.SourceFingerprint = info.Fingerprint
+		state.SourceDigest = info.BundleDigest
 	}
+}
 
-	if err != nil {
-		st.LastError = err
-		m.logger.Error("cert-sync failed",
-			"certificate", name,
-			"error", err,
-		)
-		return err
+func (m *manager) isGenerationActive(name string, generation uint64) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	_, ok := m.states[name]
+	return ok && m.generation == generation
+}
+
+func (m *manager) destinationLock(destination string) *sync.Mutex {
+	m.destinationMu.Lock()
+	defer m.destinationMu.Unlock()
+	if m.destinationLocks == nil {
+		m.destinationLocks = make(map[string]*sync.Mutex)
 	}
-
-	st.LastError = nil
-	if result.Synced {
-		st.LastSuccessfulSync = &now
-		st.DestinationFingerprint = result.SourceFP
-		m.logger.Info("cert-sync success",
-			"certificate", name,
-			"fingerprint", result.SourceFP,
-		)
-	} else if result.NoChanges {
-		destFP, _ := certSync.ReadDestinationFingerprint(st.Config.Destination.TargetDirectory, st.Config.Destination.TargetName, m.policy)
-		st.DestinationFingerprint = destFP
-		m.logger.Info("cert-sync no changes",
-			"certificate", name,
-		)
+	lock := m.destinationLocks[destination]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		m.destinationLocks[destination] = lock
 	}
-
-	if st.Config.Fallback {
-		currentFallback, _ := certSync.ReadFallback(st.Config.Destination.TargetDirectory, m.policy)
-		st.FallbackPendingRestart = currentFallback != st.Config.Destination.TargetName
-	} else {
-		st.FallbackPendingRestart = false
-	}
-
-	return nil
+	return lock
 }
 
 func (m *manager) stopWatchers() {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.stopWatchersLocked()
+	oldWatchers := m.watchers
+	m.watchers = make(map[string]managedWatcher)
+	m.generation++
+	m.mu.Unlock()
+	stopWatchers(oldWatchers)
 }
 
-func (m *manager) stopWatchersLocked() {
-	for _, w := range m.watchers {
-		w.Stop()
+func stopWatchers(watchers map[string]managedWatcher) {
+	for _, watch := range watchers {
+		watch.Stop()
 	}
-	m.watchers = make(map[string]*watcher.Watcher)
 }
